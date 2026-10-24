@@ -20,11 +20,28 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
+	"github.com/sriramg-aivar/nexogent/internal/fingerprint"
 	"github.com/sriramg-aivar/nexogent/internal/ranking"
 	"github.com/sriramg-aivar/nexogent/internal/types"
 )
+
+// slug makes a short stable key fragment from a title.
+func slug(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == ' ' || r == '-' || r == '_':
+			b.WriteRune('-')
+		}
+		if b.Len() >= 40 {
+			break
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
 
 // ScoutSuiteCollector reads ScoutSuite results from a directory.
 type ScoutSuiteCollector struct {
@@ -91,20 +108,28 @@ func (p *ScoutSuiteCollector) Collect(ctx context.Context) ([]types.Finding, []s
 			if len(f.Items) > 0 {
 				resourceID = f.Items[0]
 			}
+			svc := strings.ToLower(svcName)
+			checkID := "scout-" + svc + "-" + slug(title)
+			normID := fingerprint.NormaliseResourceID(svc, resourceID, p.region, p.accountID)
+			canon := fingerprint.Canonical("scoutsuite", checkID)
+			fp := fingerprint.Of(p.accountID, svc, p.region, normID, canon)
 			findings = append(findings, types.Finding{
-				ID:             uuid.NewString(),
+				ID:             fp,
+				Fingerprint:    fp,
+				CanonicalKey:   canon,
+				CheckID:        checkID,
 				Source:         "scoutsuite",
 				NativeSeverity: f.Level,
 				Severity:       sev,
-				Service:        strings.ToLower(svcName),
-				ResourceID:     resourceID,
+				Service:        svc,
+				ResourceID:     normID,
 				Region:         p.region,
 				AccountID:      p.accountID,
 				Title:          title,
 				Description:    f.Rationale,
 				Recommendation: rec,
-				Factors:        ranking.DefaultFactors(sev, strings.ToLower(svcName), public, true),
-				FirstSeen:      time.Now().UTC(),
+				Factors:        ranking.DefaultFactors(sev, svc, public, true),
+				Sources:        []types.SourceRef{{Source: "scoutsuite", CheckID: checkID, NativeSeverity: f.Level}},
 			})
 		}
 	}

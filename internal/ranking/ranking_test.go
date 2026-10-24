@@ -28,12 +28,19 @@ func TestPostureScore(t *testing.T) {
 	if PostureScore([]types.Finding{crit}) != 80 {
 		t.Fatal("one critical should be 80")
 	}
+	// Per-severity cap (D13): many criticals cap the critical penalty at 60,
+	// so the score floors at 40 rather than hitting 0.
 	many := make([]types.Finding, 10)
 	for i := range many {
 		many[i] = crit
 	}
-	if PostureScore(many) != 0 {
-		t.Fatal("should clamp to 0")
+	if got := PostureScore(many); got != 40 {
+		t.Fatalf("critical penalty should cap at 60 -> score 40, got %d", got)
+	}
+	// Fixed and accepted findings do not count toward the score.
+	fixedOnly := []types.Finding{{Severity: types.SevCritical, Status: types.StatusFixed}}
+	if PostureScore(fixedOnly) != 100 {
+		t.Fatal("fixed findings should not lower the score")
 	}
 }
 

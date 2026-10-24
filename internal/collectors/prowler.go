@@ -18,8 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
+	"github.com/sriramg-aivar/nexogent/internal/fingerprint"
 	"github.com/sriramg-aivar/nexogent/internal/ranking"
 	"github.com/sriramg-aivar/nexogent/internal/types"
 )
@@ -40,10 +39,10 @@ func (p *ProwlerCollector) Name() string { return "prowler" }
 // ocsfFinding is the subset of Prowler's OCSF Detection Finding we use.
 // Matches Prowler 5.x OCSF 1.x output.
 type ocsfFinding struct {
-	StatusCode  string `json:"status_code"` // PASS | FAIL | MANUAL
-	Severity    string `json:"severity"`    // Critical/High/Medium/Low/Informational
-	Message     string `json:"message"`
-	Metadata    struct {
+	StatusCode string `json:"status_code"` // PASS | FAIL | MANUAL
+	Severity   string `json:"severity"`    // Critical/High/Medium/Low/Informational
+	Message    string `json:"message"`
+	Metadata   struct {
 		EventCode string `json:"event_code"` // the prowler check id
 	} `json:"metadata"`
 	FindingInfo struct {
@@ -160,13 +159,19 @@ func (p *ProwlerCollector) toFinding(it ocsfFinding) types.Finding {
 		public = true
 	}
 
+	normID := fingerprint.NormaliseResourceID(service, resourceID, region, p.accountID)
+	canon := fingerprint.Canonical("prowler", checkID)
+	fp := fingerprint.Of(p.accountID, service, region, normID, canon)
 	return types.Finding{
-		ID:               uuid.NewString(),
+		ID:               fp,
+		Fingerprint:      fp,
+		CanonicalKey:     canon,
+		CheckID:          checkID,
 		Source:           "prowler",
 		NativeSeverity:   it.Severity,
 		Severity:         sev,
 		Service:          service,
-		ResourceID:       resourceID,
+		ResourceID:       normID,
 		Region:           region,
 		AccountID:        p.accountID,
 		Title:            title,
@@ -174,7 +179,7 @@ func (p *ProwlerCollector) toFinding(it ocsfFinding) types.Finding {
 		Recommendation:   rec,
 		FrameworkControl: checkID,
 		Factors:          ranking.DefaultFactors(sev, service, public, true),
-		FirstSeen:        time.Now().UTC(),
+		Sources:          []types.SourceRef{{Source: "prowler", CheckID: checkID, NativeSeverity: it.Severity}},
 	}
 }
 
@@ -224,6 +229,7 @@ func (p *ProwlerCollector) latestOCSF() (string, error) {
 //   - a single JSON array of findings
 //   - multiple concatenated JSON arrays (Prowler can append across runs)
 //   - newline-delimited JSON objects
+//
 // by streaming successive JSON values from the input.
 func parseOCSF(raw []byte) ([]ocsfFinding, error) {
 	dec := json.NewDecoder(strings.NewReader(string(raw)))

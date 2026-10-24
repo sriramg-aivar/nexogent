@@ -18,8 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
+	"github.com/sriramg-aivar/nexogent/internal/fingerprint"
 	"github.com/sriramg-aivar/nexogent/internal/ranking"
 	"github.com/sriramg-aivar/nexogent/internal/types"
 )
@@ -41,12 +40,12 @@ func (p *CloudsplainingCollector) Name() string { return "cloudsplaining" }
 // schema varies by version; we read the common "results" map of principals ->
 // risk buckets, plus a flattened fallback.
 type csEntry struct {
-	PolicyName               string   `json:"PolicyName"`
-	PrivilegeEscalation      []any    `json:"PrivilegeEscalation"`
-	DataExfiltration         []string `json:"DataExfiltrationActions"`
-	ResourceExposure         []string `json:"ResourceExposureActions"`
-	CredentialsExposure      []string `json:"CredentialsExposureActions"`
-	PermissionsManagement    []string `json:"PermissionsManagementActions"`
+	PolicyName            string   `json:"PolicyName"`
+	PrivilegeEscalation   []any    `json:"PrivilegeEscalation"`
+	DataExfiltration      []string `json:"DataExfiltrationActions"`
+	ResourceExposure      []string `json:"ResourceExposureActions"`
+	CredentialsExposure   []string `json:"CredentialsExposureActions"`
+	PermissionsManagement []string `json:"PermissionsManagementActions"`
 }
 
 func (p *CloudsplainingCollector) Collect(ctx context.Context) ([]types.Finding, []string) {
@@ -84,34 +83,46 @@ func (p *CloudsplainingCollector) Collect(ctx context.Context) ([]types.Finding,
 			if len(actions) == 0 {
 				return
 			}
+			checkID := "cloudsplaining-" + strings.ReplaceAll(strings.ToLower(risk), " ", "-")
+			normID := fingerprint.NormaliseResourceID("iam", name, "global", p.accountID)
+			canon := fingerprint.Canonical("cloudsplaining", checkID)
+			fp := fingerprint.Of(p.accountID, "iam", "global", normID, canon)
 			findings = append(findings, types.Finding{
-				ID:             uuid.NewString(),
-				Source:         "cloudsplaining",
-				NativeSeverity: string(sev),
-				Severity:       sev,
-				Service:        "iam",
-				ResourceID:     name,
-				Region:         "global",
-				AccountID:      p.accountID,
-				Title:          fmt.Sprintf("IAM policy '%s' allows %s", name, risk),
-				Description:    fmt.Sprintf("%d risky action(s): %s", len(actions), strings.Join(firstN(actions, 5), ", ")),
-				Recommendation: "Scope this policy down; remove the risky actions or restrict resources/conditions.",
-				FrameworkControl: "cloudsplaining:" + strings.ReplaceAll(strings.ToLower(risk), " ", "-"),
-				Factors:        ranking.DefaultFactors(sev, "iam", false, true),
-				FirstSeen:      time.Now().UTC(),
+				ID:               fp,
+				Fingerprint:      fp,
+				CanonicalKey:     canon,
+				CheckID:          checkID,
+				Source:           "cloudsplaining",
+				NativeSeverity:   string(sev),
+				Severity:         sev,
+				Service:          "iam",
+				ResourceID:       normID,
+				Region:           "global",
+				AccountID:        p.accountID,
+				Title:            fmt.Sprintf("IAM policy '%s' allows %s", name, risk),
+				Description:      fmt.Sprintf("%d risky action(s): %s", len(actions), strings.Join(firstN(actions, 5), ", ")),
+				Recommendation:   "Scope this policy down; remove the risky actions or restrict resources/conditions.",
+				FrameworkControl: checkID,
+				Factors:          ranking.DefaultFactors(sev, "iam", false, true),
+				Sources:          []types.SourceRef{{Source: "cloudsplaining", CheckID: checkID}},
 			})
 		}
 		if len(e.PrivilegeEscalation) > 0 {
+			checkID := "cloudsplaining-privilege-escalation"
+			normID := fingerprint.NormaliseResourceID("iam", name, "global", p.accountID)
+			canon := fingerprint.Canonical("cloudsplaining", checkID)
+			fp := fingerprint.Of(p.accountID, "iam", "global", normID, canon)
 			findings = append(findings, types.Finding{
-				ID: uuid.NewString(), Source: "cloudsplaining", NativeSeverity: "CRITICAL",
-				Severity: types.SevCritical, Service: "iam", ResourceID: name, Region: "global",
-				AccountID: p.accountID,
-				Title:     fmt.Sprintf("IAM policy '%s' enables privilege escalation", name),
-				Description: fmt.Sprintf("%d privilege-escalation path(s) detected.", len(e.PrivilegeEscalation)),
-				Recommendation: "Remove the actions that allow escalation (e.g. iam:PassRole + create/update).",
-				FrameworkControl: "cloudsplaining:privilege-escalation",
-				Factors:   ranking.DefaultFactors(types.SevCritical, "iam", false, true),
-				FirstSeen: time.Now().UTC(),
+				ID: fp, Fingerprint: fp, CanonicalKey: canon, CheckID: checkID,
+				Source: "cloudsplaining", NativeSeverity: "CRITICAL",
+				Severity: types.SevCritical, Service: "iam", ResourceID: normID, Region: "global",
+				AccountID:        p.accountID,
+				Title:            fmt.Sprintf("IAM policy '%s' enables privilege escalation", name),
+				Description:      fmt.Sprintf("%d privilege-escalation path(s) detected.", len(e.PrivilegeEscalation)),
+				Recommendation:   "Remove the actions that allow escalation (e.g. iam:PassRole + create/update).",
+				FrameworkControl: checkID,
+				Factors:          ranking.DefaultFactors(types.SevCritical, "iam", false, true),
+				Sources:          []types.SourceRef{{Source: "cloudsplaining", CheckID: checkID}},
 			})
 		}
 		add(types.SevHigh, "data exfiltration", e.DataExfiltration)

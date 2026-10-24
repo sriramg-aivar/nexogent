@@ -9,6 +9,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
@@ -118,10 +119,13 @@ func (d *Discoverer) Inventory(ctx context.Context) ([]types.Resource, []string)
 			}
 			for _, f := range []regFn{
 				{"ec2", d.ec2},
+				{"ec2sg", d.securityGroups},
+				{"ec2vol", d.volumes},
 				{"lambda", d.lambda},
 				{"rds", d.rds},
 				{"dynamodb", d.dynamodb},
 				{"eks", d.eks},
+				{"cloudtrail", d.cloudtrail},
 			} {
 				rs, err := f.fn(ctx, rcfg, region)
 				if err != nil {
@@ -276,4 +280,149 @@ func (d *Discoverer) eks(ctx context.Context, cfg aws.Config, region string) ([]
 		})
 	}
 	return rs, nil
+}
+
+// cloudtrail lists trails as resources (F16). region = the trail's home region.
+func (d *Discoverer) cloudtrail(ctx context.Context, cfg aws.Config, region string) ([]types.Resource, error) {
+	c := cloudtrail.NewFromConfig(cfg)
+	out, err := c.DescribeTrails(ctx, &cloudtrail.DescribeTrailsInput{})
+	if err != nil {
+		return nil, err
+	}
+	var rs []types.Resource
+	for _, t := range out.TrailList {
+		home := aws.ToString(t.HomeRegion)
+		if home == "" {
+			home = region
+		}
+		// Only emit a trail from its home region to avoid duplicates.
+		if home != region {
+			continue
+		}
+		rs = append(rs, types.Resource{
+			ID: aws.ToString(t.TrailARN), Service: "cloudtrail", Type: "trail",
+			Name: aws.ToString(t.Name), Region: home, AccountID: d.accountID,
+			Attrs: map[string]string{"multi_region": boolStr(aws.ToBool(t.IsMultiRegionTrail))},
+		})
+	}
+	return rs, nil
+}
+
+// securityGroups lists SGs as resources so the UI can filter by type (F16).
+func (d *Discoverer) securityGroups(ctx context.Context, cfg aws.Config, region string) ([]types.Resource, error) {
+	c := ec2.NewFromConfig(cfg)
+	out, err := c.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{})
+	if err != nil {
+		return nil, err
+	}
+	var rs []types.Resource
+	for _, sg := range out.SecurityGroups {
+		id := aws.ToString(sg.GroupId)
+		rs = append(rs, types.Resource{
+			ID:      "arn:aws:ec2:" + region + ":" + d.accountID + ":security-group/" + id,
+			Service: "ec2", Type: "security-group",
+			Name: aws.ToString(sg.GroupName), Region: region, AccountID: d.accountID,
+		})
+	}
+	return rs, nil
+}
+
+// volumes lists EBS volumes as resources (F16).
+func (d *Discoverer) volumes(ctx context.Context, cfg aws.Config, region string) ([]types.Resource, error) {
+	c := ec2.NewFromConfig(cfg)
+	out, err := c.DescribeVolumes(ctx, &ec2.DescribeVolumesInput{})
+	if err != nil {
+		return nil, err
+	}
+	var rs []types.Resource
+	for _, v := range out.Volumes {
+		id := aws.ToString(v.VolumeId)
+		rs = append(rs, types.Resource{
+			ID:      "arn:aws:ec2:" + region + ":" + d.accountID + ":volume/" + id,
+			Service: "ec2", Type: "volume",
+			Name: id, Region: region, AccountID: d.accountID,
+			Attrs: map[string]string{"encrypted": boolStr(aws.ToBool(v.Encrypted))},
+		})
+	}
+	return rs, nil
+}
+
+func boolStr(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+// InventoryService inventories only one service across all regions (used by the
+// quick-audit path so a scoped audit does not re-discover the whole account).
+func (d *Discoverer) InventoryService(ctx context.Context, service string) ([]types.Resource, []string) {
+	regions, rerr := d.EnabledRegions(ctx)
+	var (
+		mu    sync.Mutex
+		res   []types.Resource
+		warns []string
+	)
+	addRes := func(rs []types.Resource) { mu.Lock(); res = append(res, rs...); mu.Unlock() }
+	addWarn := func(w string) { mu.Lock(); warns = append(warns, w); mu.Unlock() }
+	if rerr != nil {
+		addWarn("regions: " + rerr.Error())
+	}
+
+	switch service {
+	case "iam":
+		if rs, err := d.iam(ctx, d.cfg); err != nil {
+			addWarn("iam: " + err.Error())
+		} else {
+			addRes(rs)
+		}
+		return res, warns
+	case "s3":
+		if rs, err := d.s3(ctx, d.cfg); err != nil {
+			addWarn("s3: " + err.Error())
+		} else {
+			addRes(rs)
+		}
+		return res, warns
+	}
+
+	regional := map[string]func(context.Context, aws.Config, string) ([]types.Resource, error){
+		"ec2":        d.ec2,
+		"lambda":     d.lambda,
+		"rds":        d.rds,
+		"dynamodb":   d.dynamodb,
+		"eks":        d.eks,
+		"cloudtrail": d.cloudtrail,
+	}
+	fn, ok := regional[service]
+	if !ok {
+		return res, warns
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 6)
+	for _, region := range regions {
+		wg.Add(1)
+		go func(region string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			rcfg := d.cfgForRegion(ctx, region)
+			if rs, err := fn(ctx, rcfg, region); err != nil {
+				addWarn(service + " (" + region + "): " + err.Error())
+			} else {
+				addRes(rs)
+			}
+			// EC2 also includes SGs and volumes for completeness.
+			if service == "ec2" {
+				if rs, err := d.securityGroups(ctx, rcfg, region); err == nil {
+					addRes(rs)
+				}
+				if rs, err := d.volumes(ctx, rcfg, region); err == nil {
+					addRes(rs)
+				}
+			}
+		}(region)
+	}
+	wg.Wait()
+	return res, warns
 }

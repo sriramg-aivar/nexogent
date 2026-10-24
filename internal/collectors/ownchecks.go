@@ -17,8 +17,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/google/uuid"
 
+	"github.com/sriramg-aivar/nexogent/internal/fingerprint"
 	"github.com/sriramg-aivar/nexogent/internal/ranking"
 	"github.com/sriramg-aivar/nexogent/internal/types"
 )
@@ -61,16 +61,20 @@ func (o *OwnChecks) wants(service string) bool {
 	return o.filterService == "" || o.filterService == service
 }
 
-func (o *OwnChecks) mk(service, resource, region string, sev types.Severity, title, desc, rec, control string, public, reachable bool) types.Finding {
+func (o *OwnChecks) mk(checkID, service, resource, region string, sev types.Severity, title, desc, rec, control string, public, reachable bool) types.Finding {
 	if region == "" {
 		region = o.region
 	}
+	normID := fingerprint.NormaliseResourceID(service, resource, region, o.accountID)
+	canon := fingerprint.Canonical("own-check", checkID)
+	fp := fingerprint.Of(o.accountID, service, region, normID, canon)
 	return types.Finding{
-		ID: uuid.NewString(), Source: "own-check", NativeSeverity: string(sev),
-		Severity: sev, Service: service, ResourceID: resource, Region: region,
+		ID: fp, Fingerprint: fp, CanonicalKey: canon, CheckID: checkID,
+		Source: "own-check", NativeSeverity: string(sev),
+		Severity: sev, Service: service, ResourceID: normID, Region: region,
 		AccountID: o.accountID, Title: title, Description: desc, Recommendation: rec,
 		FrameworkControl: control, Factors: ranking.DefaultFactors(sev, service, public, reachable),
-		FirstSeen: time.Now().UTC(),
+		Sources: []types.SourceRef{{Source: "own-check", CheckID: checkID, NativeSeverity: string(sev)}},
 	}
 }
 
@@ -128,6 +132,7 @@ func (o *OwnChecks) Collect(ctx context.Context) ([]types.Finding, []string) {
 			for _, c := range []rc{
 				{"ec2", o.checkSGs},
 				{"ec2", o.checkEBS},
+				{"ec2", o.checkIMDSv2},
 				{"eks", o.checkEKS},
 				{"rds", o.checkRDS},
 				{"lambda", o.checkLambda},
@@ -174,7 +179,7 @@ func (o *OwnChecks) checkIAM(ctx context.Context, cfg aws.Config) ([]types.Findi
 		name := aws.ToString(u.UserName)
 		mfa, err := c.ListMFADevices(ctx, &iam.ListMFADevicesInput{UserName: u.UserName})
 		if err == nil && len(mfa.MFADevices) == 0 {
-			fs = append(fs, o.mk("iam", aws.ToString(u.Arn), "global", types.SevHigh,
+			fs = append(fs, o.mk("iam-user-no-mfa", "iam", aws.ToString(u.Arn), "global", types.SevHigh,
 				fmt.Sprintf("IAM user '%s' has no MFA", name),
 				"Console/CLI users without MFA are a common breach vector.",
 				"Enable an MFA device for this user.", "CIS 1.10", false, true))
@@ -183,10 +188,27 @@ func (o *OwnChecks) checkIAM(ctx context.Context, cfg aws.Config) ([]types.Findi
 		if err == nil {
 			for _, p := range pols.AttachedPolicies {
 				if aws.ToString(p.PolicyName) == "AdministratorAccess" {
-					fs = append(fs, o.mk("iam", aws.ToString(u.Arn), "global", types.SevMedium,
+					fs = append(fs, o.mk("iam-user-admin-attached", "iam", aws.ToString(u.Arn), "global", types.SevMedium,
 						fmt.Sprintf("IAM user '%s' has AdministratorAccess", name),
 						"Direct admin on a user violates least privilege.",
 						"Prefer roles and scoped policies over user-attached admin.", "CIS 1.16", false, true))
+				}
+			}
+		}
+		// Old active access keys (> 90 days).
+		keys, err := c.ListAccessKeys(ctx, &iam.ListAccessKeysInput{UserName: u.UserName})
+		if err == nil {
+			for _, k := range keys.AccessKeyMetadata {
+				if string(k.Status) != "Active" || k.CreateDate == nil {
+					continue
+				}
+				ageDays := int(time.Since(*k.CreateDate).Hours() / 24)
+				if ageDays > 90 {
+					fs = append(fs, o.mk("iam-old-access-key", "iam", aws.ToString(u.Arn), "global", types.SevMedium,
+						fmt.Sprintf("IAM user '%s' has an access key %d days old", name, ageDays),
+						"Long-lived access keys are a common credential-leak risk.",
+						"Rotate the access key and remove unused keys.", "CIS 1.14", false, true))
+					break
 				}
 			}
 		}
@@ -214,13 +236,13 @@ func (o *OwnChecks) checkS3(ctx context.Context, cfg aws.Config) ([]types.Findin
 				aws.ToBool(cfg.BlockPublicPolicy) && aws.ToBool(cfg.RestrictPublicBuckets)
 		}
 		if !blocked {
-			fs = append(fs, o.mk("s3", arn, "global", types.SevHigh,
+			fs = append(fs, o.mk("s3-public-access-block", "s3", arn, "global", types.SevHigh,
 				fmt.Sprintf("S3 bucket '%s' is not fully blocking public access", name),
 				"Buckets without full public-access-block can be exposed.",
 				"Enable all four Block Public Access settings.", "AWS FSBP S3.1", true, true))
 		}
 		if _, err := c.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: b.Name}); err != nil {
-			fs = append(fs, o.mk("s3", arn, "global", types.SevMedium,
+			fs = append(fs, o.mk("s3-default-encryption", "s3", arn, "global", types.SevMedium,
 				fmt.Sprintf("S3 bucket '%s' has no default encryption", name),
 				"Objects may be stored unencrypted at rest.",
 				"Enable default SSE-S3 or SSE-KMS encryption.", "AWS FSBP S3.4", false, false))
@@ -251,7 +273,7 @@ func (o *OwnChecks) checkSGs(ctx context.Context, cfg aws.Config, region string)
 						sev = types.SevCritical
 					}
 					arn := fmt.Sprintf("arn:aws:ec2:%s:%s:security-group/%s", region, o.accountID, aws.ToString(sg.GroupId))
-					fs = append(fs, o.mk("ec2", arn, region, sev,
+					fs = append(fs, o.mk("ec2-sg-open-world", "ec2", arn, region, sev,
 						fmt.Sprintf("Security group %s allows 0.0.0.0/0 on port %d", aws.ToString(sg.GroupId), from),
 						"Open-to-the-world ingress exposes the service to the internet.",
 						"Restrict the CIDR to known IPs or use SSM/VPN.", "AWS FSBP EC2.2", true, true))
@@ -275,7 +297,7 @@ func (o *OwnChecks) checkEBS(ctx context.Context, cfg aws.Config, region string)
 		if !aws.ToBool(v.Encrypted) {
 			id := aws.ToString(v.VolumeId)
 			arn := fmt.Sprintf("arn:aws:ec2:%s:%s:volume/%s", region, o.accountID, id)
-			fs = append(fs, o.mk("ec2", arn, region, types.SevMedium,
+			fs = append(fs, o.mk("ebs-unencrypted", "ec2", arn, region, types.SevMedium,
 				fmt.Sprintf("EBS volume %s is not encrypted", id),
 				"Unencrypted EBS volumes store data at rest in the clear.",
 				"Enable EBS encryption (enable account-level default encryption).", "AWS FSBP EC2.7", false, true))
@@ -303,7 +325,7 @@ func (o *OwnChecks) checkEKS(ctx context.Context, cfg aws.Config, region string)
 		if vpc != nil && vpc.EndpointPublicAccess {
 			for _, cidr := range vpc.PublicAccessCidrs {
 				if cidr == "0.0.0.0/0" {
-					fs = append(fs, o.mk("eks", arn, region, types.SevHigh,
+					fs = append(fs, o.mk("eks-public-endpoint", "eks", arn, region, types.SevHigh,
 						fmt.Sprintf("EKS cluster '%s' API endpoint is public to 0.0.0.0/0", name),
 						"A world-reachable Kubernetes API increases attack surface.",
 						"Restrict publicAccessCidrs or use private endpoint access.", "CIS EKS 5.4.2", true, true))
@@ -327,13 +349,13 @@ func (o *OwnChecks) checkRDS(ctx context.Context, cfg aws.Config, region string)
 		arn := aws.ToString(i.DBInstanceArn)
 		name := aws.ToString(i.DBInstanceIdentifier)
 		if aws.ToBool(i.PubliclyAccessible) {
-			fs = append(fs, o.mk("rds", arn, region, types.SevHigh,
+			fs = append(fs, o.mk("rds-public", "rds", arn, region, types.SevHigh,
 				fmt.Sprintf("RDS instance '%s' is publicly accessible", name),
 				"A publicly accessible database is reachable from the internet.",
 				"Set PubliclyAccessible=false and use private subnets.", "AWS FSBP RDS.2", true, true))
 		}
 		if !aws.ToBool(i.StorageEncrypted) {
-			fs = append(fs, o.mk("rds", arn, region, types.SevMedium,
+			fs = append(fs, o.mk("rds-unencrypted", "rds", arn, region, types.SevMedium,
 				fmt.Sprintf("RDS instance '%s' storage is not encrypted", name),
 				"Unencrypted RDS storage exposes data at rest.",
 				"Enable storage encryption (requires recreate/snapshot copy).", "AWS FSBP RDS.3", false, true))
@@ -356,7 +378,7 @@ func (o *OwnChecks) checkLambda(ctx context.Context, cfg aws.Config, region stri
 		name := aws.ToString(f.FunctionName)
 		urlc, err := c.GetFunctionUrlConfig(ctx, &lambda.GetFunctionUrlConfigInput{FunctionName: f.FunctionName})
 		if err == nil && urlc != nil && string(urlc.AuthType) == "NONE" {
-			fs = append(fs, o.mk("lambda", arn, region, types.SevHigh,
+			fs = append(fs, o.mk("lambda-public-url", "lambda", arn, region, types.SevHigh,
 				fmt.Sprintf("Lambda '%s' has a public Function URL (AuthType NONE)", name),
 				"An unauthenticated Function URL is invokable by anyone.",
 				"Set AuthType=AWS_IAM or remove the Function URL.", "AWS FSBP Lambda.3", true, true))
@@ -382,7 +404,7 @@ func (o *OwnChecks) checkDynamoDB(ctx context.Context, cfg aws.Config, region st
 		// SSEDescription nil / DISABLED => using AWS-owned key (not a KMS CMK).
 		if desc.Table.SSEDescription == nil {
 			arn := aws.ToString(desc.Table.TableArn)
-			fs = append(fs, o.mk("dynamodb", arn, region, types.SevLow,
+			fs = append(fs, o.mk("dynamodb-encryption", "dynamodb", arn, region, types.SevLow,
 				fmt.Sprintf("DynamoDB table '%s' uses default (AWS-owned) encryption", name),
 				"Default encryption gives no customer-managed key control or audit.",
 				"Enable a customer-managed KMS key for sensitive tables.", "AWS FSBP DynamoDB.4", false, true))
@@ -412,10 +434,34 @@ func (o *OwnChecks) checkCloudTrail(ctx context.Context, cfg aws.Config, region 
 	}
 	if !hasMultiRegion {
 		arn := fmt.Sprintf("arn:aws:cloudtrail:%s:%s:trail/*", region, o.accountID)
-		return []types.Finding{o.mk("cloudtrail", arn, region, types.SevHigh,
+		return []types.Finding{o.mk("cloudtrail-multiregion", "cloudtrail", arn, region, types.SevHigh,
 			"No multi-region CloudTrail trail is enabled",
 			"Without a multi-region trail, API activity in other regions is not logged.",
 			"Create a multi-region CloudTrail trail with log file validation.", "CIS 3.1", false, true)}, nil
 	}
 	return nil, nil
+}
+
+// checkIMDSv2 flags EC2 instances that still allow IMDSv1 (HttpTokens != required).
+// Uses DescribeInstances (already allowed), so no extra API call.
+func (o *OwnChecks) checkIMDSv2(ctx context.Context, cfg aws.Config, region string) ([]types.Finding, error) {
+	c := ec2.NewFromConfig(cfg)
+	out, err := c.DescribeInstances(ctx, &ec2.DescribeInstancesInput{})
+	if err != nil {
+		return nil, err
+	}
+	var fs []types.Finding
+	for _, r := range out.Reservations {
+		for _, i := range r.Instances {
+			id := aws.ToString(i.InstanceId)
+			if i.MetadataOptions != nil && string(i.MetadataOptions.HttpTokens) != "required" {
+				arn := fmt.Sprintf("arn:aws:ec2:%s:%s:instance/%s", region, o.accountID, id)
+				fs = append(fs, o.mk("ec2-imdsv2", "ec2", arn, region, types.SevMedium,
+					fmt.Sprintf("EC2 instance %s allows IMDSv1 (token not required)", id),
+					"IMDSv1 is vulnerable to SSRF credential theft from the instance metadata service.",
+					"Set MetadataOptions HttpTokens=required to enforce IMDSv2.", "AWS FSBP EC2.8", false, true))
+			}
+		}
+	}
+	return fs, nil
 }
