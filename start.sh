@@ -85,6 +85,28 @@ eksctl create iamserviceaccount \
 ROLE_ARN="$(aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.Arn' --output text)"
 echo ">> IRSA role: ${ROLE_ARN}"
 
+# ---- 4b. DynamoDB reviews table (persistence) ----
+REVIEWS_TABLE="${REVIEWS_TABLE:-nexogent-reviews}"
+if [ -n "${REVIEWS_TABLE}" ]; then
+  if aws dynamodb describe-table --table-name "${REVIEWS_TABLE}" --region "${REGION}" >/dev/null 2>&1; then
+    echo ">> DynamoDB table ${REVIEWS_TABLE} exists"
+  else
+    echo ">> Creating DynamoDB table ${REVIEWS_TABLE} (PK pk, SK sk)"
+    aws dynamodb create-table --table-name "${REVIEWS_TABLE}" --region "${REGION}" \
+      --billing-mode PAY_PER_REQUEST \
+      --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \
+      --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE >/dev/null
+    aws dynamodb wait table-exists --table-name "${REVIEWS_TABLE}" --region "${REGION}"
+  fi
+fi
+
+# ---- 4c. Superadmin password (v1 auth gate) ----
+# Provide SUPERADMIN_PASSWORD in the environment; never paste it in a commit.
+if [ -z "${SUPERADMIN_PASSWORD:-}" ]; then
+  echo "!! SUPERADMIN_PASSWORD not set — the portal auth gate will be OPEN."
+  echo "   Export SUPERADMIN_PASSWORD before running start.sh to protect the portal."
+fi
+
 # ---- 5. Cluster prerequisites: EBS CSI driver (PVC) + ALB controller (Ingress) ----
 # These are required for the shared Prowler PVC and the public ALB URL.
 # See deploy/CLUSTER_PREREQS.md to install them once per cluster.
@@ -113,6 +135,8 @@ helm upgrade --install nexogent deploy/helm/nexogent \
   --set frontend.image.tag="${IMAGE_TAG}" \
   --set serviceAccount.roleArn="${ROLE_ARN}" \
   --set region="${REGION}" \
+  --set persistence.reviewsTable="${REVIEWS_TABLE}" \
+  --set-string auth.password="${SUPERADMIN_PASSWORD:-}" \
   --wait --timeout 6m
 
 echo ">> Done. Workloads:"

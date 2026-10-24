@@ -34,6 +34,7 @@ if [[ "${1:-}" == "--purge" ]]; then
   aws iam delete-policy --policy-arn "${POLICY_ARN}" 2>/dev/null || true
   aws ecr delete-repository --repository-name "${BACKEND_REPO}" --region "${REGION}" --force 2>/dev/null || true
   aws ecr delete-repository --repository-name "${FRONTEND_REPO}" --region "${REGION}" --force 2>/dev/null || true
+  aws dynamodb delete-table --table-name "${REVIEWS_TABLE:-nexogent-reviews}" --region "${REGION}" 2>/dev/null || true
   kubectl delete namespace "${NAMESPACE}" 2>/dev/null || true
   echo ">> Purge complete."
 else

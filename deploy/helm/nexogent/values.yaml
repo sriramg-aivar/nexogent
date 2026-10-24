@@ -9,18 +9,40 @@
 region: us-east-1
 bedrockModelId: "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
-# The read-only IRSA role both the backend and prowler assume. No static keys.
+# ---- v1: single superadmin auth gate ----
+# Set auth.password (or provide auth.existingSecret) so the portal isn't public.
+# If empty, the gate is OPEN (dev only) and the backend logs a warning.
+auth:
+  password: ""            # plain value -> stored in a Secret by the chart
+  existingSecret: ""      # or reference an existing Secret with key SUPERADMIN_PASSWORD
+
+# ---- v1: persistence (DynamoDB) so reviews survive restarts / multi-replica ----
+persistence:
+  reviewsTable: "nexogent-reviews"   # empty => in-memory only
+
+# ---- v1: in-process scheduler (periodic reviews). Empty disables it ----
+# The Prowler CronJob still runs on its own schedule regardless.
+scanInterval: "6h"
+
+# The read-only IRSA role both the backend and scanners assume. No static keys.
 serviceAccount:
   create: true
   name: nexogent-sa
   roleArn: "" # arn:aws:iam::<account>:role/NexogentReadOnly
 
-# Shared volume where the Prowler CronJob writes OCSF JSON and the backend reads it.
+# Shared volume where scanners write results and the backend reads them.
+# All scanner dirs live under this one PVC mount (/data).
 prowlerResults:
   enabled: true
   storageClass: gp2
   size: 1Gi
   mountPath: /data/prowler
+
+# Mount paths the backend reads for each scanner's output (all under /data).
+scannerDirs:
+  prowler: /data/prowler
+  scoutsuite: /data/scoutsuite
+  cloudsplaining: /data/cloudsplaining
 
 # ---------------------------------------------------------------- backend ----
 backend:
@@ -65,6 +87,28 @@ prowler:
   resources:
     requests: { cpu: 200m, memory: 512Mi }
     limits:   { cpu: "1", memory: 1Gi }
+
+# ------------------------------------------------------- extra scanners (D) ----
+# Additional open-source, read-only scanners behind the same Finding model.
+# Disabled by default; enable per client. Each writes to its own results dir on
+# the shared PVC and the backend ingests it.
+scoutsuite:
+  enabled: false
+  image: { repository: rossja/ncc-scoutsuite, tag: latest, pullPolicy: IfNotPresent }
+  schedule: "30 */12 * * *"
+  mountPath: /data/scoutsuite
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: "1", memory: 1Gi }
+
+cloudsplaining:
+  enabled: false
+  image: { repository: python, tag: "3.12-slim", pullPolicy: IfNotPresent }
+  schedule: "45 */12 * * *"
+  mountPath: /data/cloudsplaining
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
 
 # ---------------------------------------------------------------- ingress ----
 # ALB ingress via the AWS Load Balancer Controller. Routes:

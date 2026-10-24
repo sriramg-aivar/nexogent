@@ -96,3 +96,23 @@ type CollectorError struct {
 	Source  string `json:"source"`
 	Message string `json:"message"`
 }
+
+// Integration describes an external AWS security service shown in the UI.
+// In v1, GuardDuty / Security Hub / Inspector are shown as DISABLED toggles.
+type Integration struct {
+	Key         string `json:"key"`         // guardduty | securityhub | inspector
+	Name        string `json:"name"`        // human label
+	Description string `json:"description"` // what it would add
+	Enabled     bool   `json:"enabled"`     // always false in v1
+	Available   bool   `json:"available"`   // false => greyed-out toggle in v1
+	Note        string `json:"note"`
+}
+
+// ServiceInfo describes one supported AWS service for the portal landing page.
+type ServiceInfo struct {
+	Key           string `json:"key"`   // ec2, s3, iam, ...
+	Name          string `json:"name"`  // "Amazon EC2"
+	Scope         string `json:"scope"` // "regional" | "global"
+	ResourceCount int    `json:"resource_count"`
+	FindingCount  int    `json:"finding_count"`
+}

@@ -1,0 +1,59 @@
+{{- if .Values.scoutsuite.enabled -}}
+# ScoutSuite (open-source, read-only multi-service posture auditor).
+# Disabled by default; enable per client once the image/command are confirmed.
+# Runs under the read-only IRSA role and writes results to the shared PVC.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nexogent-scoutsuite
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nexogent.labels" . | nindent 4 }}
+    app.kubernetes.io/name: nexogent
+    app.kubernetes.io/component: scoutsuite
+spec:
+  schedule: {{ .Values.scoutsuite.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "nexogent.componentSelector" (dict "root" . "component" "scoutsuite") | nindent 12 }}
+        spec:
+          serviceAccountName: {{ include "nexogent.serviceAccountName" . }}
+          restartPolicy: Never
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+            runAsUser: 1000
+            fsGroup: 1000
+          containers:
+            - name: scoutsuite
+              image: "{{ .Values.scoutsuite.image.repository }}:{{ .Values.scoutsuite.image.tag }}"
+              imagePullPolicy: {{ .Values.scoutsuite.image.pullPolicy }}
+              # scout aws --no-browser --report-dir <dir> (read-only).
+              args:
+                - "aws"
+                - "--no-browser"
+                - "--report-dir"
+                - {{ .Values.scoutsuite.mountPath | quote }}
+                - "--result-format"
+                - "json"
+              env:
+                - name: AWS_REGION
+                  value: {{ .Values.region | quote }}
+                - name: AWS_DEFAULT_REGION
+                  value: {{ .Values.region | quote }}
+              volumeMounts:
+                - name: results
+                  mountPath: {{ .Values.scoutsuite.mountPath }}
+              resources:
+                {{- toYaml .Values.scoutsuite.resources | nindent 16 }}
+          volumes:
+            - name: results
+              persistentVolumeClaim:
+                claimName: nexogent-prowler-results
+{{- end -}}

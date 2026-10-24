@@ -42,11 +42,30 @@ spec:
             - name: LISTEN_ADDR
               value: ":8080"
             - name: PROWLER_RESULTS_DIR
-              value: {{ .Values.prowlerResults.mountPath | quote }}
+              value: {{ .Values.scannerDirs.prowler | quote }}
+            - name: SCOUTSUITE_RESULTS_DIR
+              value: {{ .Values.scannerDirs.scoutsuite | quote }}
+            - name: CLOUDSPLAINING_RESULTS_DIR
+              value: {{ .Values.scannerDirs.cloudsplaining | quote }}
+            {{- if .Values.persistence.reviewsTable }}
+            - name: REVIEWS_TABLE
+              value: {{ .Values.persistence.reviewsTable | quote }}
+            {{- end }}
+            {{- if .Values.scanInterval }}
+            - name: SCAN_INTERVAL
+              value: {{ .Values.scanInterval | quote }}
+            {{- end }}
+            {{- if or .Values.auth.password .Values.auth.existingSecret }}
+            - name: SUPERADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret | default "nexogent-auth" }}
+                  key: SUPERADMIN_PASSWORD
+            {{- end }}
           {{- if .Values.prowlerResults.enabled }}
           volumeMounts:
-            - name: prowler-results
-              mountPath: {{ .Values.prowlerResults.mountPath }}
+            - name: results
+              mountPath: /data
               readOnly: true
           {{- end }}
           livenessProbe:
@@ -61,7 +80,7 @@ spec:
             {{- toYaml .Values.backend.resources | nindent 12 }}
       {{- if .Values.prowlerResults.enabled }}
       volumes:
-        - name: prowler-results
+        - name: results
           persistentVolumeClaim:
             claimName: nexogent-prowler-results
       {{- end }}

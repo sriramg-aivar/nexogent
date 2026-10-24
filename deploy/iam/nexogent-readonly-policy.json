@@ -7,23 +7,34 @@
       "Action": [
         "ec2:Describe*",
         "s3:GetBucket*",
+        "s3:GetAccountPublicAccessBlock",
         "s3:ListAllMyBuckets",
         "s3:GetEncryptionConfiguration",
         "iam:Get*",
         "iam:List*",
         "iam:GenerateCredentialReport",
         "iam:GetCredentialReport",
+        "iam:GenerateServiceLastAccessedDetails",
         "lambda:List*",
         "lambda:Get*",
         "rds:Describe*",
+        "rds:ListTagsForResource",
         "dynamodb:Describe*",
         "dynamodb:List*",
         "ecs:List*",
         "ecs:Describe*",
         "eks:Describe*",
         "eks:List*",
+        "cloudtrail:Describe*",
+        "cloudtrail:Get*",
+        "cloudtrail:ListTrails",
         "access-analyzer:List*",
         "access-analyzer:Get*",
+        "kms:List*",
+        "kms:Describe*",
+        "cloudwatch:Describe*",
+        "logs:Describe*",
+        "sns:List*",
         "sts:GetCallerIdentity"
       ],
       "Resource": "*"
@@ -33,6 +44,20 @@
       "Effect": "Allow",
       "Action": ["bedrock:InvokeModel"],
       "Resource": "arn:aws:bedrock:*::foundation-model/anthropic.*"
+    },
+    {
+      "Sid": "ReviewsPersistence",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:BatchWriteItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:*:*:table/nexogent-reviews",
+        "arn:aws:dynamodb:*:*:table/nexogent-reviews/index/*"
+      ]
     }
   ]
 }

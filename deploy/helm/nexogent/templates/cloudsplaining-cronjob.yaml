@@ -1,0 +1,66 @@
+{{- if .Values.cloudsplaining.enabled -}}
+# cloudsplaining (open-source, read-only IAM policy risk scanner).
+# Disabled by default; enable per client. Runs under the read-only IRSA role
+# (needs iam:Get*/List*) and writes JSON findings to the shared PVC.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nexogent-cloudsplaining
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nexogent.labels" . | nindent 4 }}
+    app.kubernetes.io/name: nexogent
+    app.kubernetes.io/component: cloudsplaining
+spec:
+  schedule: {{ .Values.cloudsplaining.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "nexogent.componentSelector" (dict "root" . "component" "cloudsplaining") | nindent 12 }}
+        spec:
+          serviceAccountName: {{ include "nexogent.serviceAccountName" . }}
+          restartPolicy: Never
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+            runAsUser: 1000
+            fsGroup: 1000
+          containers:
+            - name: cloudsplaining
+              image: "{{ .Values.cloudsplaining.image.repository }}:{{ .Values.cloudsplaining.image.tag }}"
+              imagePullPolicy: {{ .Values.cloudsplaining.image.pullPolicy }}
+              # Install cloudsplaining, download account authorization details,
+              # then scan — all read-only. Output JSON lands in the shared dir.
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+                  pip install --quiet --no-cache-dir cloudsplaining
+                  cd {{ .Values.cloudsplaining.mountPath }}
+                  cloudsplaining download --output account-authorization-details.json
+                  cloudsplaining scan --input-file account-authorization-details.json \
+                    --output-directory {{ .Values.cloudsplaining.mountPath }} || true
+                  # Normalize the findings json name the collector looks for.
+                  find {{ .Values.cloudsplaining.mountPath }} -name '*.json' -maxdepth 2 -print
+              env:
+                - name: AWS_REGION
+                  value: {{ .Values.region | quote }}
+                - name: AWS_DEFAULT_REGION
+                  value: {{ .Values.region | quote }}
+                - name: HOME
+                  value: {{ .Values.cloudsplaining.mountPath | quote }}
+              volumeMounts:
+                - name: results
+                  mountPath: {{ .Values.cloudsplaining.mountPath }}
+              resources:
+                {{- toYaml .Values.cloudsplaining.resources | nindent 16 }}
+          volumes:
+            - name: results
+              persistentVolumeClaim:
+                claimName: nexogent-prowler-results
+{{- end -}}
