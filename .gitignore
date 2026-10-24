@@ -1,0 +1,21 @@
+# Binaries
+/nexogent
+/bin/
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+
+# Env / secrets — never commit
+.env
+*.pem
+credentials
+
+# Node / dashboard build
+node_modules/
+dashboard/dist/
+
+# OS
+.DS_Store
