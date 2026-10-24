@@ -1,0 +1,11 @@
+# Keep the build context tiny and the image clean.
+.git
+.gitignore
+.kiro
+docs
+dashboard
+deploy
+README.md
+*.md
+start.sh
+stop.sh

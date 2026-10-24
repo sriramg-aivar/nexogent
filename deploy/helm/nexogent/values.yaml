@@ -1,0 +1,62 @@
+# Default values for the Nexogent Helm chart.
+# Override with --set or a -f values file at deploy time.
+
+# Region the agent operates in (also sets AWS_REGION for the SDK).
+region: us-east-1
+
+# Amazon Bedrock model used for explanations. Offline fallback is automatic.
+bedrockModelId: "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+image:
+  repository: ""          # e.g. 338449997393.dkr.ecr.us-east-1.amazonaws.com/nexogent
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# The read-only IRSA role the agent assumes. No static keys ever.
+serviceAccount:
+  create: true
+  name: nexogent-sa
+  # arn:aws:iam::<account>:role/NexogentReadOnly
+  roleArn: ""
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# Ingress exposes the agent API / dashboard. Disabled by default; a
+# Service of type LoadBalancer or `kubectl port-forward` also works.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  path: /
+  pathType: Prefix
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+# Hardened defaults for a read-only security product.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

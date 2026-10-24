@@ -1,0 +1,38 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOnlyInventoryAndChecks",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:Describe*",
+        "s3:GetBucket*",
+        "s3:ListAllMyBuckets",
+        "s3:GetEncryptionConfiguration",
+        "iam:Get*",
+        "iam:List*",
+        "iam:GenerateCredentialReport",
+        "iam:GetCredentialReport",
+        "lambda:List*",
+        "lambda:Get*",
+        "rds:Describe*",
+        "dynamodb:Describe*",
+        "dynamodb:List*",
+        "ecs:List*",
+        "ecs:Describe*",
+        "eks:Describe*",
+        "eks:List*",
+        "access-analyzer:List*",
+        "access-analyzer:Get*",
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "BedrockExplanations",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel"],
+      "Resource": "arn:aws:bedrock:*::foundation-model/anthropic.*"
+    }
+  ]
+}
