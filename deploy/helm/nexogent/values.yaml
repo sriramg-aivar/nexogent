@@ -1,61 +1,90 @@
-# Default values for the Nexogent Helm chart.
-# Override with --set or a -f values file at deploy time.
+# Default values for the Nexogent microservice chart.
+#
+# Deploys THREE workloads into the client's EKS:
+#   - backend  : Go agent/API (read-only, IRSA)            [Deployment + Service]
+#   - frontend : React dashboard served by Nginx            [Deployment + Service]
+#   - prowler  : open-source scanner (read-only, IRSA)      [CronJob + Job]
+# Plus a shared PVC (Prowler results) and an ALB Ingress for a public URL.
 
-# Region the agent operates in (also sets AWS_REGION for the SDK).
 region: us-east-1
-
-# Amazon Bedrock model used for explanations. Offline fallback is automatic.
 bedrockModelId: "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
-image:
-  repository: ""          # e.g. 338449997393.dkr.ecr.us-east-1.amazonaws.com/nexogent
-  tag: latest
-  pullPolicy: IfNotPresent
-
-replicaCount: 1
-
-# The read-only IRSA role the agent assumes. No static keys ever.
+# The read-only IRSA role both the backend and prowler assume. No static keys.
 serviceAccount:
   create: true
   name: nexogent-sa
-  # arn:aws:iam::<account>:role/NexogentReadOnly
-  roleArn: ""
+  roleArn: "" # arn:aws:iam::<account>:role/NexogentReadOnly
 
-service:
-  type: ClusterIP
-  port: 8080
+# Shared volume where the Prowler CronJob writes OCSF JSON and the backend reads it.
+prowlerResults:
+  enabled: true
+  storageClass: gp2
+  size: 1Gi
+  mountPath: /data/prowler
 
-# Ingress exposes the agent API / dashboard. Disabled by default; a
-# Service of type LoadBalancer or `kubectl port-forward` also works.
+# ---------------------------------------------------------------- backend ----
+backend:
+  image:
+    repository: ""   # <acct>.dkr.ecr.<region>.amazonaws.com/nexogent
+    tag: latest
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    port: 8080
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 250m, memory: 256Mi }
+
+# --------------------------------------------------------------- frontend ----
+frontend:
+  image:
+    repository: ""   # <acct>.dkr.ecr.<region>.amazonaws.com/nexogent-frontend
+    tag: latest
+    pullPolicy: Always
+  replicaCount: 1
+  service:
+    port: 80
+    targetPort: 8080
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits:   { cpu: 100m, memory: 128Mi }
+
+# ---------------------------------------------------------------- prowler ----
+prowler:
+  enabled: true
+  image:
+    repository: toniblyx/prowler
+    tag: latest
+    pullPolicy: IfNotPresent
+  # Cron schedule (UTC). Default: every 6 hours.
+  schedule: "0 */6 * * *"
+  # Also run once right after install so the dashboard has Prowler data fast.
+  runOnInstall: true
+  # Extra args passed to prowler (region is injected automatically).
+  args: []
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: "1", memory: 1Gi }
+
+# ---------------------------------------------------------------- ingress ----
+# ALB ingress via the AWS Load Balancer Controller. Routes:
+#   /        -> frontend
+#   /api,/health -> backend
 ingress:
-  enabled: false
-  className: ""
-  annotations: {}
+  enabled: true
+  className: alb
+  # Internet-facing ALB. Set to false / internal for a private endpoint.
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
   host: ""
-  path: /
-  pathType: Prefix
 
-resources:
-  requests:
-    cpu: 50m
-    memory: 64Mi
-  limits:
-    cpu: 250m
-    memory: 256Mi
-
-# Hardened defaults for a read-only security product.
+# Hardened defaults.
 podSecurityContext:
   runAsNonRoot: true
-  runAsUser: 65532
-  seccompProfile:
-    type: RuntimeDefault
-
-securityContext:
-  allowPrivilegeEscalation: false
-  readOnlyRootFilesystem: true
-  capabilities:
-    drop:
-      - ALL
+  seccompProfile: { type: RuntimeDefault }
 
 nodeSelector: {}
 tolerations: []

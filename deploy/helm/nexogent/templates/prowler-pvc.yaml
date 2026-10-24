@@ -1,0 +1,17 @@
+{{- if .Values.prowlerResults.enabled -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nexogent-prowler-results
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nexogent.labels" . | nindent 4 }}
+    app.kubernetes.io/name: nexogent
+    app.kubernetes.io/component: prowler
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.prowlerResults.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.prowlerResults.size }}
+{{- end -}}

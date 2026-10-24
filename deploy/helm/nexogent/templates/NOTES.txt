@@ -1,20 +1,26 @@
-Nexogent is installed in namespace "{{ .Release.Namespace }}".
+Nexogent (microservices) installed in namespace "{{ .Release.Namespace }}".
 
-READ-ONLY agent. It inventories the account and reports; it changes nothing.
+READ-ONLY. It inventories the account and reports; it changes nothing.
 
-1. Check the pod is running:
-   kubectl -n {{ .Release.Namespace }} get pods,svc
-
-2. Reach the API:
+Workloads deployed:
+  - nexogent-backend   (Deployment + Service)  Go agent/API, IRSA read-only
+  - nexogent-frontend  (Deployment + Service)  React dashboard (Nginx)
+{{- if .Values.prowler.enabled }}
+  - nexogent-prowler   (CronJob{{ if .Values.prowler.runOnInstall }} + initial Job{{ end }})  open-source Prowler scanner, IRSA read-only
+{{- end }}
 {{- if .Values.ingress.enabled }}
-   Ingress host: http{{ if .Values.ingress.host }}://{{ .Values.ingress.host }}{{ end }}{{ .Values.ingress.path }}
-{{- else }}
-   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "nexogent.fullname" . }} 8080:{{ .Values.service.port }}
-   curl -s localhost:8080/health
+  - nexogent           (Ingress / ALB)         public entry: / -> frontend, /api -> backend
 {{- end }}
 
-3. Run a posture review (read-only):
-   curl -s -X POST localhost:8080/api/v1/review | head
+Check status:
+  kubectl -n {{ .Release.Namespace }} get deploy,svc,pods,cronjob,ingress
 
-The agent assumes IRSA role:
-  {{ .Values.serviceAccount.roleArn | default "(none set — set serviceAccount.roleArn)" }}
+{{ if .Values.ingress.enabled -}}
+Get the public URL (ALB takes ~2-3 min to provision):
+  kubectl -n {{ .Release.Namespace }} get ingress nexogent -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+{{- else -}}
+Port-forward the dashboard:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/nexogent-frontend 8080:{{ .Values.frontend.service.port }}
+{{- end }}
+
+Backend IRSA role: {{ .Values.serviceAccount.roleArn | default "(set serviceAccount.roleArn)" }}

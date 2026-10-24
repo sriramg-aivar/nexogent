@@ -22,20 +22,22 @@ import (
 
 // Server holds dependencies and the in-memory review store.
 type Server struct {
-	cfg       aws.Config
-	region    string
-	explainer *bedrock.Explainer
+	cfg            aws.Config
+	region         string
+	explainer      *bedrock.Explainer
+	prowlerResults string // dir where the Prowler CronJob writes OCSF JSON
 
 	mu      sync.RWMutex
 	reviews map[string]*types.PostureReview
 	latest  *types.PostureReview
 }
 
-func NewServer(cfg aws.Config, region, bedrockModel string) *Server {
+func NewServer(cfg aws.Config, region, bedrockModel, prowlerResults string) *Server {
 	return &Server{
 		cfg: cfg, region: region,
-		explainer: bedrock.New(cfg, bedrockModel),
-		reviews:   map[string]*types.PostureReview{},
+		explainer:      bedrock.New(cfg, bedrockModel),
+		prowlerResults: prowlerResults,
+		reviews:        map[string]*types.PostureReview{},
 	}
 }
 
@@ -50,6 +52,18 @@ func (s *Server) RunReview(ctx context.Context) (*types.PostureReview, error) {
 	own := collectors.NewOwnChecks(s.cfg, accountID, s.region)
 	findings, cwarns := own.Collect(ctx)
 
+	sourcesRun := []string{"own-check"}
+	warnings := append(dwarns, cwarns...)
+
+	// Prowler (open-source scanner) results, written by the Prowler CronJob.
+	prowler := collectors.NewProwlerCollector(s.prowlerResults, accountID, s.region)
+	pfindings, pwarns := prowler.Collect(ctx)
+	if len(pfindings) > 0 {
+		findings = append(findings, pfindings...)
+		sourcesRun = append(sourcesRun, "prowler")
+	}
+	warnings = append(warnings, pwarns...)
+
 	findings = ranking.RankFindings(findings)
 	score := ranking.PostureScore(findings)
 
@@ -59,8 +73,8 @@ func (s *Server) RunReview(ctx context.Context) (*types.PostureReview, error) {
 		DurationSeconds: time.Since(start).Seconds(),
 		PostureScore:    score, Rating: ranking.RatingFor(score),
 		Summary:    summarize(findings), Findings: findings, Resources: resources,
-		SourcesRun: []string{"own-check"},
-		Warnings:   append(dwarns, cwarns...),
+		SourcesRun: sourcesRun,
+		Warnings:   warnings,
 	}
 
 	s.mu.Lock()

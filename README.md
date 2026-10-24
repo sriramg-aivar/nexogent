@@ -16,15 +16,28 @@ A single small static binary, k8s-native, no interpreter or dependency sprawl in
 the client's account. The AI layer is Amazon Bedrock (a hosted API), so no local ML
 runtime is needed.
 
-## Architecture (short)
+## Architecture (microservices)
+When installed, the Helm chart deploys **three separate workloads** into the
+client's cluster, plus a shared volume and a public load balancer:
+
+- **backend** (`nexogent-backend`, Deployment+Service) — the Go agent/API.
+  Read-only, runs under the IRSA role. Serves `/api/v1/*`.
+- **frontend** (`nexogent-frontend`, Deployment+Service) — the React dashboard
+  served by Nginx, which proxies `/api` to the backend.
+- **prowler** (`nexogent-prowler`, CronJob) — the open-source **Prowler**
+  scanner. Runs read-only under the same IRSA role on a schedule and writes
+  OCSF JSON to a shared PVC that the backend ingests.
+- **ingress** (ALB) — one public URL: `/` → frontend, `/api` + `/health` → backend.
+
+### Source layout
 - `cmd/nexogent` — the agent / API server (Go)
 - `internal/discovery` — read-only AWS resource inventory, grouped by service
-- `internal/collectors` — read-only security checks (+ Prowler, external tool)
+- `internal/collectors` — read-only security checks: own-checks + **Prowler** (OCSF ingest)
 - `internal/ranking` — deterministic risk rubric (severity/exposure/reachability/criticality)
 - `internal/bedrock` — Bedrock explanations with offline fallback
 - `internal/api` — HTTP API for the dashboard
-- `dashboard/` — React dashboard
-- `deploy/helm/nexogent` — Helm chart for per-client deployment
+- `dashboard/` — React dashboard (Vite + Nginx)
+- `deploy/helm/nexogent` — Helm chart (backend, frontend, prowler, PVC, ALB ingress)
 
 ## Docs
 - `docs/PRODUCT.md` — the product vision and how it works

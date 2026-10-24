@@ -1,0 +1,26 @@
+{{- if and .Values.prowler.enabled .Values.prowler.runOnInstall -}}
+# One-off Prowler scan right after install/upgrade so the dashboard has data
+# without waiting for the first cron tick. Reuses the CronJob pod spec.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nexogent-prowler-initial-{{ .Release.Revision }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nexogent.labels" . | nindent 4 }}
+    app.kubernetes.io/name: nexogent
+    app.kubernetes.io/component: prowler
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "nexogent.componentSelector" (dict "root" . "component" "prowler") | nindent 8 }}
+    spec:
+      {{- include "nexogent.prowlerPodSpec" . | nindent 6 }}
+{{- end -}}

@@ -20,12 +20,12 @@
     "cmd/nexogent": "Go agent / API server entrypoint.",
     "internal/types": "Core domain types (Resource, Finding, RiskFactors, PostureReview, Explanation).",
     "internal/discovery": "Read-only AWS resource inventory grouped by service (ec2,s3,iam,lambda,rds,dynamodb,eks).",
-    "internal/collectors": "Read-only security checks (own-checks now; Prowler collector to add).",
+    "internal/collectors": "Read-only security checks. ownchecks.go (own checks) + prowler.go (ingests Prowler OCSF JSON from shared dir; robust parser handles single array / concatenated arrays / NDJSON; maps metadata.event_code->control, derives service from check-id prefix; only FAIL surfaced). prowler_test.go validates against real OCSF (skips unless NEXOGENT_OCSF_TESTFILE set)."
     "internal/ranking": "Deterministic risk rubric: severity 0.40, exposure 0.25, reachability 0.20, resource_criticality 0.15 -> 0..100. Posture score penalties CRIT20/HIGH12/MED5/LOW2. Ratings 90 Excellent/75 Good/60 Needs Improvement/else Critical. HAS TESTS.",
     "internal/bedrock": "Bedrock Claude explanations with offline fallback (never breaks the demo).",
     "internal/api": "HTTP API: GET /health, POST /api/v1/review, GET /api/v1/review/latest, GET /api/v1/resources (grouped by service), POST /api/v1/explain?review=&finding=.",
-    "dashboard/": "React dashboard: resources grouped by service, select a resource/service to view audit findings + posture; Explain button -> Bedrock/offline.",
-    "deploy/helm/nexogent": "Helm chart for per-client deployment (namespace, IRSA read-only SA, deployment, service, ingress)."
+    "dashboard/": "React dashboard (Vite). src/App.jsx (posture header, service sidebar, findings list, explain drawer), api.js, styles.css. Built + served by unprivileged Nginx (dashboard/Dockerfile, nginx.conf proxies /api+/health to nexogent-backend)."
+    "deploy/helm/nexogent": "Helm chart — MICROSERVICES: backend.yaml (Go agent Deployment+Service, IRSA, pullPolicy Always), frontend.yaml (React/Nginx Deployment+Service, unprivileged nginx uid101 + writable emptyDirs for conf/cache/run/tmp), prowler-cronjob.yaml (Prowler CronJob, runAsUser 1000, entrypoint takes args — NO command override), prowler-install-job.yaml (post-install hook), prowler-pvc.yaml (shared EBS PVC gp2 RWO), ingress.yaml (ALB: / -> frontend, /api+/health -> backend), serviceaccount.yaml (IRSA SA shared by backend+prowler), _helpers.tpl, NOTES.txt, values.yaml."
   },
   "aws_context": {
     "account_id": "338449997393",
@@ -36,7 +36,15 @@
     "bedrock": "Anthropic Claude models available in us-east-1 (e.g. us.anthropic.claude-haiku-4-5-20251001-v1:0). The NexogentReadOnly IRSA role HAS bedrock:InvokeModel and the model exists, but InvokeModel fails with AccessDeniedException INVALID_PAYMENT_INSTRUMENT -> the AWS account has no valid payment method, so the Marketplace model subscription can't complete. This is an account-billing action (console), not an IAM/code issue. Offline fallback works perfectly meanwhile. Add a valid payment instrument to enable live Bedrock.",
     "note": "EKS control plane + nodes bill hourly even idle. Set a budget alarm. Scale nodegroup down when not demoing."
   },
-  "verified_live": "Pure-Go agent DEPLOYED to EKS cluster eks-lab (us-east-1) and verified live in-cluster via IRSA (role NexogentReadOnly, no static keys). Pod Running 1/1. All 5 API endpoints OK: /health, POST /api/v1/review, GET /api/v1/review/latest, GET /api/v1/resources, POST /api/v1/explain. Review against account 338449997393: posture 15/100 Critical, 7 findings (SSH 0.0.0.0/0 #1 at 94, EKS public endpoint, IAM no-MFA x2, S3/admin), 5 resources grouped ec2/eks/iam. Explain uses offline fallback (Bedrock blocked by account billing). go build ./... + go test ./... pass. helm lint clean.",
+  "verified_live": "MICROSERVICES deployed to eks-lab (us-east-1) and verified via public ALB. 3 workloads: nexogent-backend (1/1, IRSA, digest 866580b), nexogent-frontend (1/1, unprivileged nginx), nexogent-prowler (CronJob every 6h). Shared EBS PVC. Public URL http://k8s-nexogent-nexogent-48d3232e4b-*.us-east-1.elb.amazonaws.com -> / serves React SPA (HTTP 200), /health + /api proxied to backend. Review combines own-check (8) + PROWLER (58) = 66 findings, sources_run ['own-check','prowler'], services ec2/eks/iam/vpc/accessanalyzer/config/fms/networkfirewall/sagemaker. Prowler ran under assumed-role/NexogentReadOnly, 661 checks, no static keys. go build/test pass, helm lint clean.",
+  "cluster_addons_installed": "Installed on eks-lab (see deploy/CLUSTER_PREREQS.md): aws-ebs-csi-driver addon (IRSA role AmazonEKS_EBS_CSI_DriverRole) for the shared PVC; AWS Load Balancer Controller v2.9.2 in kube-system (IRSA role AmazonEKSLoadBalancerControllerRole, policy AWSLoadBalancerControllerIAMPolicy) for the ALB ingress (ingressclass 'alb').",
+  "gotchas_learned": [
+    "image tag 'latest' + pullPolicy IfNotPresent = node keeps stale image; MUST use pullPolicy Always for mutable latest (fixed in values.yaml).",
+    "toniblyx/prowler ENTRYPOINT is /home/prowler/.venv/bin/prowler (not on PATH) and USER is non-numeric 'prowler' -> do NOT override command, pass args only, and set runAsUser:1000 so runAsNonRoot can verify.",
+    "nginx:alpine runs as root (fails runAsNonRoot) -> use nginxinc/nginx-unprivileged (uid 101) + emptyDir mounts on /etc/nginx/conf.d,/var/cache/nginx,/run,/tmp (pid file is /run/nginx.pid).",
+    "Prowler OCSF file can be concatenated arrays across runs -> collector uses a streaming json.Decoder.",
+    "gp2 storageclass needs the EBS CSI driver in k8s 1.37 (in-tree provisioner gone)."
+  ],
   "repo": {
     "github": "sriramg-aivar/nexogent (PRIVATE)",
     "default_branch": "main",

@@ -8,7 +8,8 @@ REGION="${REGION:-us-east-1}"
 CLUSTER="${CLUSTER:-eks-lab}"
 NODEGROUP="${NODEGROUP:-core}"
 NAMESPACE="${NAMESPACE:-nexogent}"
-REPO="${REPO:-nexogent}"
+BACKEND_REPO="${BACKEND_REPO:-nexogent}"
+FRONTEND_REPO="${FRONTEND_REPO:-nexogent-frontend}"
 POLICY_NAME="${POLICY_NAME:-NexogentReadOnly}"
 ROLE_NAME="${ROLE_NAME:-NexogentReadOnly}"
 SA_NAME="${SA_NAME:-nexogent-sa}"
@@ -31,7 +32,8 @@ if [[ "${1:-}" == "--purge" ]]; then
   POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${POLICY_NAME}"
   aws iam detach-role-policy --role-name "${ROLE_NAME}" --policy-arn "${POLICY_ARN}" 2>/dev/null || true
   aws iam delete-policy --policy-arn "${POLICY_ARN}" 2>/dev/null || true
-  aws ecr delete-repository --repository-name "${REPO}" --region "${REGION}" --force 2>/dev/null || true
+  aws ecr delete-repository --repository-name "${BACKEND_REPO}" --region "${REGION}" --force 2>/dev/null || true
+  aws ecr delete-repository --repository-name "${FRONTEND_REPO}" --region "${REGION}" --force 2>/dev/null || true
   kubectl delete namespace "${NAMESPACE}" 2>/dev/null || true
   echo ">> Purge complete."
 else

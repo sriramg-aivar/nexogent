@@ -1,33 +1,23 @@
-{{/* Chart name. */}}
-{{- define "nexogent.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
+{{/* Base name. */}}
+{{- define "nexogent.name" -}}nexogent{{- end -}}
 
-{{/* Fully qualified app name. */}}
-{{- define "nexogent.fullname" -}}
-{{- if .Values.fullnameOverride -}}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
-{{- else -}}
-{{- .Chart.Name | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-{{- end -}}
-
-{{/* Common labels. */}}
+{{/* Common labels (component passed via dict). */}}
 {{- define "nexogent.labels" -}}
-app.kubernetes.io/name: {{ include "nexogent.name" . }}
+app.kubernetes.io/part-of: nexogent
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-app.kubernetes.io/part-of: nexogent
 helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
-{{- end -}}
-
-{{/* Selector labels. */}}
-{{- define "nexogent.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "nexogent.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/* Service account name. */}}
 {{- define "nexogent.serviceAccountName" -}}
-{{- default (printf "%s-sa" (include "nexogent.fullname" .)) .Values.serviceAccount.name -}}
+{{- default "nexogent-sa" .Values.serviceAccount.name -}}
+{{- end -}}
+
+{{/* Component selector labels: include this template with a two-item list
+     (root context, component name). */}}
+{{- define "nexogent.componentSelector" -}}
+app.kubernetes.io/name: nexogent
+app.kubernetes.io/component: {{ .component }}
+app.kubernetes.io/instance: {{ .root.Release.Name }}
 {{- end -}}
