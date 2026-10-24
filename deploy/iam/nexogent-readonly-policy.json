@@ -7,6 +7,8 @@
       "Action": [
         "ec2:Describe*",
         "s3:GetBucket*",
+        "s3:GetBucketPolicyStatus",
+        "s3:GetBucketAcl",
         "s3:GetAccountPublicAccessBlock",
         "s3:ListAllMyBuckets",
         "s3:GetEncryptionConfiguration",

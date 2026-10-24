@@ -1,0 +1,50 @@
+# Local mode (F18): run Nexogent on a laptop against your own read-only AWS
+# profile, with no cluster. Deep scans are unavailable locally (kube_available=false).
+#
+#   cp .env.example .env   # set SUPERADMIN_PASSWORD, AWS_PROFILE, AWS_REGION
+#   docker compose up
+#   # optionally run Prowler once into the shared volume:
+#   docker compose --profile scan up
+services:
+  backend:
+    build: .
+    environment:
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      LISTEN_ADDR: ":8080"
+      SUPERADMIN_PASSWORD: ${SUPERADMIN_PASSWORD:-}
+      SESSION_SECRET: ${SESSION_SECRET:-local-dev-session-secret-change-me-please}
+      PROWLER_RESULTS_DIR: /data/prowler
+      DEMO_MODE: ${DEMO_MODE:-}
+    volumes:
+      - ${HOME}/.aws:/home/nonroot/.aws:ro
+      - results:/data
+    ports:
+      - "8080:8080"
+
+  frontend:
+    build: ./dashboard
+    environment:
+      BACKEND_HOST: backend
+      BACKEND_PORT: "8080"
+    ports:
+      - "8081:8080"
+    depends_on:
+      - backend
+
+  # Optional: run Prowler once into the shared volume (profile "scan").
+  prowler:
+    profiles: ["scan"]
+    image: toniblyx/prowler:latest
+    environment:
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    entrypoint: ["prowler"]
+    command: ["aws", "--region", "${AWS_REGION:-us-east-1}", "--output-formats", "json-ocsf",
+              "--output-directory", "/data/prowler", "--output-filename", "prowler-ocsf", "--status", "FAIL"]
+    volumes:
+      - ${HOME}/.aws:/home/prowler/.aws:ro
+      - results:/data
+
+volumes:
+  results:

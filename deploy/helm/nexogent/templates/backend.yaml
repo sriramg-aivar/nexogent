@@ -61,7 +61,36 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret | default "nexogent-auth" }}
                   key: SUPERADMIN_PASSWORD
+                  optional: true
             {{- end }}
+            - name: SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret | default "nexogent-auth" }}
+                  key: SESSION_SECRET
+                  optional: true
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret | default "nexogent-auth" }}
+                  key: SLACK_WEBHOOK_URL
+                  optional: true
+            - name: SESSION_TTL
+              value: {{ .Values.auth.sessionTTL | default "8h" | quote }}
+            - name: TRUST_PROXY
+              value: "true"
+            {{- if .Values.publicURL }}
+            - name: PUBLIC_URL
+              value: {{ .Values.publicURL | quote }}
+            {{- end }}
+            {{- if .Values.allowedOrigin }}
+            - name: ALLOWED_ORIGIN
+              value: {{ .Values.allowedOrigin | quote }}
+            {{- end }}
+            - name: KUBE_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: PROWLER_CRONJOB_NAME
+              value: "nexogent-prowler"
           {{- if .Values.prowlerResults.enabled }}
           volumeMounts:
             - name: results
