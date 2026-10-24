@@ -31,28 +31,28 @@ role. Never paste AWS keys into a chat or commit them.
                    │  /api → backend  │
                    └────────┬─────────┘
                             │
-   ┌────────────────────────┼──────────── EKS (client's cluster) ───────────────┐
-   │  Namespace: nexogent   │                                                    │
-   │   ┌──────────────┐     │     ┌───────────────────────────┐                 │
-   │   │  frontend    │◄────┴────►│   backend (Go API/agent)   │                 │
-   │   │ (React/Nginx)│   HTTP    │  discovery · own checks ·   │                 │
-   │   │  risk-first  │           │  lifecycle · dedupe · rank · │                │
-   │   │  portal      │           │  attack paths · reports ·    │                │
-   │   └──────────────┘           │  alerts · signed sessions    │                │
-   │                              └────┬───────────┬──────┬──────┘                │
-   │     reads results (shared PVC) ───┘           │      │ creates Jobs (RBAC)   │
-   │   ┌───────────── scanners ───────────────┐    │      ▼                       │
-   │   │ prowler CronJob + on-demand Jobs      │    │   batch/Jobs (deep scan)     │
-   │   │ (scoutsuite, cloudsplaining optional) │    │                              │
-   │   │ co-located with backend via podAffinity│   │ IRSA (read-only role)        │
-   │   └──────────────────┬────────────────────┘   │                              │
-   └──────────────────────┼─────────────────────────┼──────────────┬──────────────┘
-                          │ results volume (EBS PVC) │              │
-       ┌──────────────────┴───────────┐         ┌────┴───────┐  ┌───▼──────────────┐
-       ▼        ▼      ▼     ▼     ▼   ▼         ▼            ▼  │  DynamoDB        │
-     EC2       S3     IAM   RDS  Lambda EKS  CloudTrail  Bedrock │  reviews/history │
-   (Describe/Get/List — READ ONLY, ALL REGIONS)        (wording) │  risks/plans/... │
-                                                                  └──────────────────┘
+   ┌────────────────────────┼──────────── EKS (client's cluster) ─────────────────┐
+   │  Namespace: nexogent   │                                                     │
+   │   ┌──────────────┐     │     ┌────────────────────────────────┐              │
+   │   │  frontend    │◄────┴────►│   backend (Go API/agent)       │              │
+   │   │ (React/Nginx)│   HTTP    │  discovery · own checks ·      │              │
+   │   │  risk-first  │           │  lifecycle · dedupe · rank ·   │              │
+   │   │  portal      │           │  attack paths · reports ·      │              │
+   │   └──────────────┘           │  alerts · signed sessions      │              │
+   │                              └────┬─────────────┬──────┬──────┘              │
+   │     reads results (shared PVC) ───┘             │      │ creates Jobs (RBAC) │
+   │   ┌───────────── scanners ─────────────────┐    │      ▼                     │
+   │   │ prowler CronJob + on-demand Jobs       │    │   batch/Jobs (deep scan)   │
+   │   │ (scoutsuite, cloudsplaining optional)  │    │                            │
+   │   │ co-located with backend via podAffinity│    │ IRSA (read-only role)      │
+   │   └──────────────────┬─────────────────────┘    │                            │
+   └──────────────────────┼──────────────────────────┼────────────────┬───────────┘
+                          │ results volume (EBS PVC) │                │
+       ┌──────────────────┴───────────┐         ┌────┴───────┐   ┌────▼──────────────┐
+       ▼        ▼      ▼     ▼     ▼   ▼        ▼            ▼   │  DynamoDB         │
+     EC2       S3     IAM   RDS  Lambda EKS  CloudTrail  Bedrock │  reviews/history  │
+   (Describe/Get/List — READ ONLY, ALL REGIONS)        (wording) │  risks/plans/...  │
+                                                                 └───────────────────┘
 ```
 
 `helm install` creates: **nexogent-backend** (Deployment+Service),
