@@ -51,19 +51,13 @@
     "default_branch": "main",
     "module": "github.com/sriramg-aivar/nexogent"
   },
+  "v2_status": "v2 MSP build DEPLOYED and VERIFIED LIVE on eks-lab (us-east-1), branch v2-msp (also merged to main). Backend v2 image live (kube_available=true, store=dynamodb:nexogent-reviews, auth enforced). Verified via public ALB http://k8s-nexogent-nexogent-48d3232e4b-*.us-east-1.elb.amazonaws.com: auth gate (401 no-token, 200 with token); full multi-region scan (17 regions, 25 own-check findings, 2 duplicates merged, AP-6 attack path); 2nd scan unchanged -> new=0/fixed=0/regressed=0 (stable fingerprints); 3 history/trend points; report create->submit->approve->download valid DOCX; activity log records all actions; integrations show 3 disabled toggles; scoped ec2 quick-audit preserved all 7 iam findings (no stale data); SPA+assets+CSP header OK. All pure packages gofmt/vet/race clean. Helm v2: TLS/cert + inbound-cidrs, generated/reused SESSION_SECRET, deep-scan RBAC, prowler podAffinity. IAM policy v3 (extra reads).",
   "pending_tasks": [
-    "DONE: docs/PRODUCT.md, docs/SOW.md, docs/DEPLOYMENT.md, docs/PREREQUISITES.md (no Aivar/Ingram mentions).",
-    "DONE: Helm chart under deploy/helm/nexogent (Chart.yaml, values.yaml, serviceaccount w/ IRSA, deployment, service, ingress, _helpers.tpl, NOTES.txt). helm lint clean.",
-    "DONE: Dockerfile (multi-stage, distroless static nonroot, amd64) + .dockerignore.",
-    "DONE: deploy/iam/nexogent-readonly-policy.json (read-only + bedrock:InvokeModel).",
-    "DONE: start.sh (full spin-up) and stop.sh (teardown; --purge removes IAM/ECR/ns).",
-    "DONE: ECR repo nexogent, image built+pushed. NexogentReadOnly IAM policy+role, OIDC provider, IRSA SA nexogent-sa on eks-lab.",
-    "DONE: helm install, pod Running, verified end-to-end in-cluster via IRSA (no static keys).",
-    "TODO: Build the React dashboard under dashboard/src (resources grouped by service + posture + explain drawer). Currently empty.",
-    "TODO: Expose publicly via ingress/LoadBalancer for a public URL (currently ClusterIP + port-forward; ingress template exists but disabled).",
-    "TODO: Add Prowler collector (run Prowler as k8s Job or in-container; parse OCSF JSON).",
-    "BLOCKED (account action): Fix Bedrock by adding a valid payment instrument to the AWS account (INVALID_PAYMENT_INSTRUMENT). Role perms + model id already correct. Offline fallback fine.",
-    "TODO: After migration verified: delete the old 'final' branch in the old Codesentinal repo."
+    "DONE v2 phases 0-6: all backend packages + API + portal + deploy + docs; build/vet/race/helm-lint green; demo + auth verified.",
+    "TODO phase 7: verify on the real eks-lab account (full scan, CloudTrail card, quick vs deep, fixed/regressed lifecycle, report open in Word, 2-replica session, Slack test).",
+    "TODO: push v2-msp and open a PR / merge to main.",
+    "BLOCKED (account action): Bedrock INVALID_PAYMENT_INSTRUMENT; offline templates work meanwhile.",
+    "LATER (paid build, Part B of Nexogent-Build-Spec.md): Security Hub/GuardDuty/Inspector/Access Analyzer readers — do only when instructed."
   ],
   "rules": [
     "Never use AWS keys pasted into chat; only the locally configured profile / in-cluster IRSA.",

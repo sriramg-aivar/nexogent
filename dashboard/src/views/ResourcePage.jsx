@@ -1,110 +1,44 @@
 import React, { useEffect, useState } from 'react'
 import { api } from '../api.js'
-import { Drawer, FindingRow, serviceIcon } from '../ui.jsx'
+import { ServiceIcon } from '../icons.jsx'
+import { FindingRow, FindingDrawer } from '../components.jsx'
 import { navigate } from '../App.jsx'
 
 export default function ResourcePage({ resourceId }) {
   const [resource, setResource] = useState(null)
   const [findings, setFindings] = useState([])
-  const [reviewId, setReviewId] = useState('')
-  const [loading, setLoading] = useState(true)
-  const [auditing, setAuditing] = useState(false)
+  const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
-  const [scannedAt, setScannedAt] = useState('')
-
-  // drawer state
-  const [selected, setSelected] = useState(null)
-  const [explanation, setExplanation] = useState(null)
-  const [explaining, setExplaining] = useState(false)
+  const [sel, setSel] = useState('')
 
   async function load() {
-    setLoading(true); setErr('')
-    try {
-      const d = await api.resource(resourceId)
-      setResource(d.resource)
-      setFindings(d.findings || [])
-      setReviewId(d.review_id || '')
-    } catch (e) {
-      setErr(e.message)
-    } finally {
-      setLoading(false)
-    }
+    setErr('')
+    try { const d = await api.resource(resourceId); setResource(d.resource); setFindings(d.findings || []) }
+    catch (e) { setErr(e.message) }
   }
-
   useEffect(() => { load() /* eslint-disable-next-line */ }, [resourceId])
+  async function audit() { setBusy(true); try { const d = await api.audit(resource?.service || '', resourceId); setFindings(d.findings || []) } catch (e) { setErr('Audit failed: ' + e.message) } finally { setBusy(false) } }
 
-  async function auditResource() {
-    setAuditing(true); setErr('')
-    try {
-      const svc = resource?.service || ''
-      const d = await api.audit(svc, resourceId)
-      setFindings(d.findings || [])
-      setReviewId(d.review_id || '')
-      setScannedAt(d.scanned_at || new Date().toISOString())
-    } catch (e) {
-      setErr('Audit failed: ' + e.message)
-    } finally {
-      setAuditing(false)
-    }
-  }
-
-  async function openFinding(f) {
-    setSelected(f); setExplanation(null); setExplaining(true)
-    try {
-      const ex = await api.explain(reviewId, f.id)
-      setExplanation(ex)
-    } catch (e) {
-      setExplanation({ problem: f.title, why_dangerous: f.description, impact: '',
-        how_to_fix: [f.recommendation], provider: 'offline', model: 'n/a',
-        note: 'Explain failed: ' + e.message })
-    } finally {
-      setExplaining(false)
-    }
-  }
-
-  const svc = resource?.service || resourceId.split(':')[2] || ''
-  const sevClass = findings.length === 0 ? 'good' : 'bad'
-
+  const svc = resource?.service || ''
   return (
     <div>
       <div className="crumbs">
-        <a onClick={() => navigate('#/')}>Services</a> ›{' '}
-        {svc && <><a onClick={() => navigate('#/service/' + svc)}>{svc.toUpperCase()}</a> › </>}
-        <span>resource</span>
+        <a onClick={() => navigate('#/inventory')}>Inventory</a> › {svc && <><a onClick={() => navigate('#/service/' + svc)}>{svc.toUpperCase()}</a> › </>}resource
       </div>
-
       <div className="pagehead">
         <div>
-          <h1>{serviceIcon(svc)} {resource?.name || resourceId}</h1>
+          <h1 style={{ display: 'flex', alignItems: 'center', gap: 8 }}><ServiceIcon svc={svc} /> {resource?.name || resourceId}</h1>
           <p className="muted mono">{resourceId}</p>
-          {resource && <p className="muted">{resource.type} · {resource.region} · account {resource.account_id}</p>}
+          {resource && <p className="muted">{resource.type} · {resource.region}</p>}
         </div>
-        <button className="btn primary" onClick={auditResource} disabled={auditing}>
-          {auditing ? 'Auditing…' : 'Audit this resource'}
-        </button>
+        <button className="btn primary" onClick={audit} disabled={busy}>{busy ? 'Auditing…' : 'Quick audit this resource'}</button>
       </div>
-
       {err && <div className="banner error">{err}</div>}
-
-      <div className={'verdict ' + sevClass}>
-        {findings.length === 0
-          ? '✓ No findings on this resource. Looks fine.'
-          : `⚠ ${findings.length} finding${findings.length === 1 ? '' : 's'} on this resource.`}
-        {scannedAt && <span className="muted"> · scanned {new Date(scannedAt).toLocaleString()}</span>}
+      <div className={'banner ' + (findings.length ? 'warn' : 'info')}>
+        {findings.length ? `⚠ ${findings.length} finding${findings.length === 1 ? '' : 's'} on this resource` : '✓ No findings on this resource'}
       </div>
-
-      {loading ? <p className="muted">Loading…</p> : (
-        <div className="findings">
-          {findings.map((f) => <FindingRow key={f.id} f={f} onClick={() => openFinding(f)} />)}
-        </div>
-      )}
-
-      <Drawer
-        finding={selected}
-        explanation={explanation}
-        explaining={explaining}
-        onClose={() => setSelected(null)}
-      />
+      {findings.map(f => <FindingRow key={f.id} f={f} onClick={() => setSel(f.id)} />)}
+      {sel && <FindingDrawer id={sel} onClose={() => setSel('')} onChanged={load} />}
     </div>
   )
 }
