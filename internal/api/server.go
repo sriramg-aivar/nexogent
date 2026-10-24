@@ -1,14 +1,13 @@
-// Package api runs posture reviews and serves the HTTP API for the dashboard.
+// Package api runs posture reviews and serves the HTTP API for the v2 portal.
 package api
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"log"
-	"net/http"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -16,16 +15,23 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/google/uuid"
 
-	"github.com/sriramg-aivar/nexogent/internal/auth"
+	"github.com/sriramg-aivar/nexogent/internal/alerts"
+	"github.com/sriramg-aivar/nexogent/internal/attackpath"
+	"github.com/sriramg-aivar/nexogent/internal/audit"
 	"github.com/sriramg-aivar/nexogent/internal/bedrock"
 	"github.com/sriramg-aivar/nexogent/internal/collectors"
+	"github.com/sriramg-aivar/nexogent/internal/dedupe"
 	"github.com/sriramg-aivar/nexogent/internal/discovery"
+	"github.com/sriramg-aivar/nexogent/internal/kube"
+	"github.com/sriramg-aivar/nexogent/internal/lifecycle"
 	"github.com/sriramg-aivar/nexogent/internal/ranking"
+	"github.com/sriramg-aivar/nexogent/internal/risk"
+	"github.com/sriramg-aivar/nexogent/internal/session"
+	"github.com/sriramg-aivar/nexogent/internal/settings"
 	"github.com/sriramg-aivar/nexogent/internal/store"
 	"github.com/sriramg-aivar/nexogent/internal/types"
 )
 
-// supportedServices are the services shown on the portal landing page.
 var supportedServices = []types.ServiceInfo{
 	{Key: "ec2", Name: "Amazon EC2", Scope: "regional"},
 	{Key: "s3", Name: "Amazon S3", Scope: "global"},
@@ -37,44 +43,73 @@ var supportedServices = []types.ServiceInfo{
 	{Key: "cloudtrail", Name: "AWS CloudTrail", Scope: "regional"},
 }
 
-// Server holds dependencies and the review store.
+// Config holds server dependencies.
+type Config struct {
+	AWS            aws.Config
+	Region         string
+	BedrockModel   string
+	ProwlerResults string
+	ScoutResults   string
+	CSPResults     string
+	Store          store.Store
+	Sessions       *session.Manager
+	Throttle       *session.Throttle
+	Password       string
+	AuthEnabled    bool
+	TrustProxy     bool
+	PublicURL      string
+	Kube           kube.JobRunner
+	ProwlerCronJob string
+	Demo           bool
+	Local          bool
+	Version        string
+}
+
+// Server is the HTTP API.
 type Server struct {
-	cfg            aws.Config
-	region         string
-	explainer      *bedrock.Explainer
-	prowlerResults string
-	scoutResults   string
-	cspResults     string
-	store          store.Store
-	gate           *auth.Gate
+	cfg       Config
+	explainer *bedrock.Explainer
+	st        *state
+	store     store.Store
 
 	mu            sync.RWMutex
 	cachedRegions []string
 	regionsAt     time.Time
+	deepScans     map[string]string // run_id -> job name
+	scanning      bool
 }
 
-func NewServer(cfg aws.Config, region, bedrockModel, prowlerResults, scoutResults, cspResults string, st store.Store, gate *auth.Gate) *Server {
+func New(cfg Config) *Server {
 	return &Server{
-		cfg: cfg, region: region,
-		explainer:      bedrock.New(cfg, bedrockModel),
-		prowlerResults: prowlerResults,
-		scoutResults:   scoutResults,
-		cspResults:     cspResults,
-		store:          st,
-		gate:           gate,
+		cfg:       cfg,
+		explainer: bedrock.New(cfg.AWS, cfg.BedrockModel),
+		st:        newState(cfg.Store),
+		store:     cfg.Store,
+		deepScans: map[string]string{},
 	}
 }
 
+func randID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 func (s *Server) accountID(ctx context.Context) string {
-	out, err := sts.NewFromConfig(s.cfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if s.cfg.Demo {
+		return "123456789012"
+	}
+	out, err := sts.NewFromConfig(s.cfg.AWS).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
 		return "unknown"
 	}
 	return aws.ToString(out.Account)
 }
 
-// regions returns the enabled regions, cached for 10 minutes.
 func (s *Server) regions(ctx context.Context) []string {
+	if s.cfg.Demo {
+		return []string{"us-east-1", "eu-west-1", "ap-southeast-2"}
+	}
 	s.mu.RLock()
 	if len(s.cachedRegions) > 0 && time.Since(s.regionsAt) < 10*time.Minute {
 		r := s.cachedRegions
@@ -82,8 +117,7 @@ func (s *Server) regions(ctx context.Context) []string {
 		return r
 	}
 	s.mu.RUnlock()
-
-	disc := discovery.New(s.cfg, s.accountID(ctx), s.region)
+	disc := discovery.New(s.cfg.AWS, s.accountID(ctx), s.cfg.Region)
 	regions, _ := disc.EnabledRegions(ctx)
 	s.mu.Lock()
 	s.cachedRegions = regions
@@ -92,159 +126,228 @@ func (s *Server) regions(ctx context.Context) []string {
 	return regions
 }
 
-// RunReview performs a FULL read-only posture review across all regions and
-// persists it as the canonical "latest" review.
+// ---- scanning ----
+
+// collect runs discovery + collectors for a scope, returning fresh (pre-lifecycle)
+// findings, resources, which sources ran, and warnings.
+func (s *Server) collect(ctx context.Context, scopeService, scopeResource string, deep bool) (fresh []types.Finding, resources []types.Resource, ran map[string]bool, warns []string) {
+	accountID := s.accountID(ctx)
+	regions := s.regions(ctx)
+	ran = map[string]bool{}
+
+	disc := discovery.New(s.cfg.AWS, accountID, s.cfg.Region)
+	if scopeService != "" {
+		resources, warns = disc.InventoryService(ctx, scopeService)
+	} else {
+		resources, warns = disc.Inventory(ctx)
+	}
+
+	own := collectors.NewOwnChecks(s.cfg.AWS, accountID, s.cfg.Region).
+		WithRegions(regions).WithFilter(scopeService, scopeResource)
+	of, ow := own.Collect(ctx)
+	fresh = append(fresh, of...)
+	warns = append(warns, ow...)
+	ran["own-check"] = true
+
+	// Prowler is read on full scans and deep scans, not quick audits.
+	if scopeService == "" || deep {
+		prowler := collectors.NewProwlerCollector(s.cfg.ProwlerResults, accountID, s.cfg.Region)
+		pf, pw := prowler.Collect(ctx)
+		pf = filterFindings(pf, scopeService, scopeResource)
+		if len(pf) > 0 {
+			fresh = append(fresh, pf...)
+		}
+		warns = append(warns, pw...)
+		ran["prowler"] = true
+
+		if s.cfg.ScoutResults != "" {
+			sc := collectors.NewScoutSuiteCollector(s.cfg.ScoutResults, accountID, s.cfg.Region)
+			sf, sw := sc.Collect(ctx)
+			sf = filterFindings(sf, scopeService, scopeResource)
+			if len(sf) > 0 {
+				fresh = append(fresh, sf...)
+				ran["scoutsuite"] = true
+			}
+			warns = append(warns, sw...)
+		}
+		if s.cfg.CSPResults != "" && (scopeService == "" || scopeService == "iam") {
+			cs := collectors.NewCloudsplainingCollector(s.cfg.CSPResults, accountID, s.cfg.Region)
+			cf, cw := cs.Collect(ctx)
+			cf = filterFindings(cf, scopeService, scopeResource)
+			if len(cf) > 0 {
+				fresh = append(fresh, cf...)
+				ran["cloudsplaining"] = true
+			}
+			warns = append(warns, cw...)
+		}
+	}
+	return fresh, resources, ran, warns
+}
+
+// RunReview performs a full scan, reconciles against the latest, persists the
+// result as canonical latest, writes a history point, and evaluates alerts.
 func (s *Server) RunReview(ctx context.Context, _, _ string) (*types.PostureReview, error) {
-	review := s.runScan(ctx, "", "")
+	return s.scan(ctx, "", "", false, "full")
+}
+
+// RunAudit performs a scoped quick (or deep) audit, merging into latest.
+func (s *Server) RunAudit(ctx context.Context, service, resource string, deep bool) (*types.PostureReview, error) {
+	kind := "quick"
+	if deep {
+		kind = "deep"
+	}
+	return s.scan(ctx, service, resource, deep, kind)
+}
+
+func (s *Server) scan(ctx context.Context, scopeService, scopeResource string, deep bool, kind string) (*types.PostureReview, error) {
+	start := time.Now()
+	cfgSettings := s.st.getSettings(ctx)
+
+	fresh, resources, ran, warns := s.collect(ctx, scopeService, scopeResource, deep)
+	fresh, dupes := dedupe.Merge(fresh)
+
+	// previous review for lifecycle
+	prev, _ := s.store.Latest(ctx)
+	var prevFindings []types.Finding
+	if prev != nil {
+		prevFindings = prev.Findings
+	}
+	accepted := risk.Active(s.st.listRisks(ctx), time.Now())
+
+	scope := lifecycle.Scope{Service: scopeService, ResourceID: scopeResource, Ran: ran}
+	live, changes := lifecycle.Reconcile(prevFindings, fresh, scope, time.Now(), accepted, 90*24*time.Hour)
+
+	// join plans
+	plans := s.st.listPlans(ctx)
+	for i := range live {
+		if p, ok := plans[live[i].Fingerprint]; ok {
+			pc := p
+			live[i].Plan = &pc
+		}
+	}
+
+	// rank with configured rubric
+	w := cfgSettings.Rubric.Weights
+	for i := range live {
+		live[i].RiskScore = ranking.ComputeRiskScoreW(live[i].Factors, w.Severity, w.Exposure, w.Reachability, w.Criticality)
+	}
+	live = ranking.RankFindings(live)
+
+	// attack paths (full scans only; scoped audits keep prior paths)
+	var paths []types.AttackPath
+	if scopeService == "" {
+		facts := s.collectFacts(ctx, resources, live)
+		paths = attackpath.Compute(facts, live, cfgSettings.Paths)
+		markOnPath(live, paths)
+	} else if prev != nil {
+		paths = prev.Paths
+	}
+
+	score := ranking.PostureScoreCfg(live, cfgSettings.Rubric.Penalty, cfgSettings.Rubric.PerSeverityCap)
+	rating := ratingFromBands(score, cfgSettings.Rubric.Bands)
+
+	// merge resources for scoped audits
+	if scopeService != "" && prev != nil {
+		resources = mergeResources(prev.Resources, resources, scopeService)
+	}
+
+	sourcesStatus := map[string]types.SourceStatus{}
+	for src := range ran {
+		sourcesStatus[src] = types.SourceStatus{Ran: true, At: time.Now(), Count: countBySource(live, src)}
+	}
+
+	review := &types.PostureReview{
+		ReviewID: uuid.NewString(), AccountID: s.accountID(ctx), Regions: s.regions(ctx),
+		Status: "completed", CreatedAt: time.Now().UTC(), DurationSeconds: time.Since(start).Seconds(),
+		PostureScore: score, Rating: rating, Summary: summarize(live),
+		Findings: live, Resources: resources, Paths: paths,
+		SourcesRun: keys(ran), Warnings: warns,
+		Changes: types.Changes{
+			New: ids(changes.New), Fixed: ids(changes.Fixed), Regressed: ids(changes.Regressed),
+			NewCount: len(changes.New), FixedCount: len(changes.Fixed), RegressedCount: len(changes.Regressed),
+		},
+		SourcesStatus: sourcesStatus, DuplicatesMerged: dupes, Scope: scopeTag(scopeService, scopeResource),
+	}
+
 	if err := s.store.Put(ctx, review); err != nil {
 		log.Printf("store.Put: %v", err)
 	}
+	// history + alerts on full scans
+	if scopeService == "" {
+		s.st.putHistory(ctx, types.HistoryPoint{
+			At: review.CreatedAt, ReviewID: review.ReviewID, Score: score, Rating: rating,
+			Open: countOpen(live), BySeverity: review.Summary.BySeverity,
+			New: review.Changes.NewCount, Fixed: review.Changes.FixedCount,
+			Regressed: review.Changes.RegressedCount,
+		})
+		s.evaluateAlerts(ctx, cfgSettings, changes, paths, prev)
+	}
+	action := audit.ScanFull
+	if kind == "quick" {
+		action = audit.ScanQuick
+	} else if kind == "deep" {
+		action = audit.ScanDeepFinish
+	}
+	s.st.logActivity(ctx, audit.Entry{Actor: "system", Action: action, TargetType: "scope", Target: review.Scope})
 	return review, nil
 }
 
-// RunAudit performs a SCOPED on-demand audit (one service and/or resource).
-// It does NOT replace the canonical latest full review; instead it merges the
-// fresh findings for that scope back into the stored latest so the portal
-// stays consistent, and returns the scoped result to the caller.
-func (s *Server) RunAudit(ctx context.Context, service, resource string) *types.PostureReview {
-	scoped := s.runScan(ctx, service, resource)
-	s.mergeScopedIntoLatest(ctx, service, resource, scoped)
-	return scoped
+func (s *Server) collectFacts(ctx context.Context, resources []types.Resource, findings []types.Finding) attackpath.Facts {
+	if s.cfg.Demo {
+		return attackpath.Facts{Account: s.accountID(ctx)}
+	}
+	// Derive conservative facts from findings + resources (read-only, no extra calls
+	// beyond discovery already done). Full fact collection via AWS is in discovery;
+	// here we build a minimal, test-covered view to feed the pure engine.
+	return buildFactsFromReview(s.accountID(ctx), resources, findings)
 }
 
-// runScan does the actual read-only discovery + collection, optionally scoped.
-func (s *Server) runScan(ctx context.Context, filterService, filterResource string) *types.PostureReview {
-	start := time.Now()
-	accountID := s.accountID(ctx)
-	regions := s.regions(ctx)
-
-	disc := discovery.New(s.cfg, accountID, s.region)
-	resources, dwarns := disc.Inventory(ctx)
-	// Scope resources to match the filter (keeps the scoped review coherent).
-	resources = filterResources(resources, filterService, filterResource)
-
-	own := collectors.NewOwnChecks(s.cfg, accountID, s.region).
-		WithRegions(regions).
-		WithFilter(filterService, filterResource)
-	findings, cwarns := own.Collect(ctx)
-
-	sourcesRun := []string{"own-check"}
-	warnings := append(dwarns, cwarns...)
-
-	// Prowler results (written by the Prowler CronJob / on-demand Job).
-	prowler := collectors.NewProwlerCollector(s.prowlerResults, accountID, s.region)
-	pfindings, pwarns := prowler.Collect(ctx)
-	pfindings = filterFindings(pfindings, filterService, filterResource)
-	if len(pfindings) > 0 {
-		findings = append(findings, pfindings...)
-		sourcesRun = append(sourcesRun, "prowler")
-	}
-	warnings = append(warnings, pwarns...)
-
-	// ScoutSuite (open-source multi-service posture auditor).
-	if s.scoutResults != "" {
-		scout := collectors.NewScoutSuiteCollector(s.scoutResults, accountID, s.region)
-		sfindings, swarns := scout.Collect(ctx)
-		sfindings = filterFindings(sfindings, filterService, filterResource)
-		if len(sfindings) > 0 {
-			findings = append(findings, sfindings...)
-			sourcesRun = append(sourcesRun, "scoutsuite")
-		}
-		warnings = append(warnings, swarns...)
-	}
-
-	// cloudsplaining (open-source IAM policy risk). Only relevant for IAM scope.
-	if s.cspResults != "" && (filterService == "" || filterService == "iam") {
-		csp := collectors.NewCloudsplainingCollector(s.cspResults, accountID, s.region)
-		cfindings, cwarns2 := csp.Collect(ctx)
-		cfindings = filterFindings(cfindings, filterService, filterResource)
-		if len(cfindings) > 0 {
-			findings = append(findings, cfindings...)
-			sourcesRun = append(sourcesRun, "cloudsplaining")
-		}
-		warnings = append(warnings, cwarns2...)
-	}
-
-	findings = ranking.RankFindings(findings)
-	score := ranking.PostureScore(findings)
-
-	return &types.PostureReview{
-		ReviewID: uuid.NewString(), AccountID: accountID, Regions: regions,
-		Status: "completed", CreatedAt: time.Now().UTC(),
-		DurationSeconds: time.Since(start).Seconds(),
-		PostureScore:    score, Rating: ranking.RatingFor(score),
-		Summary:    summarize(findings), Findings: findings, Resources: resources,
-		SourcesRun: sourcesRun,
-		Warnings:   warnings,
-	}
-}
-
-// mergeScopedIntoLatest updates the stored latest full review: it replaces the
-// findings for the scoped service/resource with the fresh ones, and merges any
-// newly discovered resources. If there is no latest yet, the scoped result is
-// persisted as-is.
-func (s *Server) mergeScopedIntoLatest(ctx context.Context, service, resource string, scoped *types.PostureReview) {
-	latest, _ := s.store.Latest(ctx)
-	if latest == nil {
-		_ = s.store.Put(ctx, scoped)
+func (s *Server) evaluateAlerts(ctx context.Context, cfg settings.Settings, ch lifecycle.Changes, paths []types.AttackPath, prev *types.PostureReview) {
+	if !cfg.Alerts.WebhookSet {
 		return
 	}
-	// Drop old findings in scope, keep the rest.
-	var kept []types.Finding
-	for _, f := range latest.Findings {
-		if service != "" && f.Service != service {
-			kept = append(kept, f)
+	var events []alerts.Event
+	for _, f := range ch.New {
+		if f.Severity == types.SevCritical && cfg.Alerts.Events["new_critical"] {
+			events = append(events, alerts.Event{Kind: "new_critical", Fingerprint: f.Fingerprint, Title: f.Title})
+		} else if f.Severity == types.SevHigh && cfg.Alerts.Events["new_high"] {
+			events = append(events, alerts.Event{Kind: "new_high", Fingerprint: f.Fingerprint, Title: f.Title})
+		}
+	}
+	for _, f := range ch.Regressed {
+		if cfg.Alerts.Events["regressed"] {
+			events = append(events, alerts.Event{Kind: "regressed", Fingerprint: f.Fingerprint, Title: f.Title})
+		}
+	}
+	// suppress already-sent
+	var toSend []alerts.Event
+	for _, e := range events {
+		if s.st.alertSent(ctx, e.SuppressKey()) {
 			continue
 		}
-		if resource != "" && f.ResourceID != resource {
-			kept = append(kept, f)
-			continue
+		toSend = append(toSend, e)
+		s.st.markAlertSent(ctx, e.SuppressKey())
+	}
+	if len(toSend) == 0 {
+		return
+	}
+	// The webhook value lives in a Secret-backed env; the sender validates it.
+	webhook := envWebhook()
+	if webhook == "" {
+		return
+	}
+	sender := alerts.NewSender(webhook, nil)
+	if cfg.Alerts.Mode == "digest" {
+		_ = sender.Send(ctx, alerts.BuildDigest(toSend, s.cfg.PublicURL))
+	} else {
+		for _, e := range toSend {
+			_ = sender.Send(ctx, alerts.BuildImmediate(e, s.cfg.PublicURL))
 		}
-		// in-scope -> drop (will be replaced by fresh scoped findings)
 	}
-	kept = append(kept, scoped.Findings...)
-	kept = ranking.RankFindings(kept)
-
-	// Merge resources by ID.
-	resByID := map[string]types.Resource{}
-	for _, r := range latest.Resources {
-		resByID[r.ID] = r
-	}
-	for _, r := range scoped.Resources {
-		resByID[r.ID] = r
-	}
-	merged := make([]types.Resource, 0, len(resByID))
-	for _, r := range resByID {
-		merged = append(merged, r)
-	}
-
-	latest.Findings = kept
-	latest.Resources = merged
-	latest.Summary = summarize(kept)
-	latest.PostureScore = ranking.PostureScore(kept)
-	latest.Rating = ranking.RatingFor(latest.PostureScore)
-	latest.CreatedAt = time.Now().UTC()
-	if err := s.store.Put(ctx, latest); err != nil {
-		log.Printf("merge store.Put: %v", err)
-	}
+	s.st.logActivity(ctx, audit.Entry{Actor: "system", Action: audit.AlertSent, Detail: fmt.Sprintf("%d alert(s)", len(toSend))})
 }
 
-func filterResources(rs []types.Resource, service, resource string) []types.Resource {
-	if service == "" && resource == "" {
-		return rs
-	}
-	var out []types.Resource
-	for _, r := range rs {
-		if service != "" && r.Service != service {
-			continue
-		}
-		if resource != "" && r.ID != resource {
-			continue
-		}
-		out = append(out, r)
-	}
-	return out
-}
+// ---- helpers ----
 
 func filterFindings(fs []types.Finding, service, resource string) []types.Finding {
 	if service == "" && resource == "" {
@@ -263,329 +366,116 @@ func filterFindings(fs []types.Finding, service, resource string) []types.Findin
 	return out
 }
 
+func mergeResources(prev, cur []types.Resource, service string) []types.Resource {
+	byID := map[string]types.Resource{}
+	for _, r := range prev {
+		if r.Service != service {
+			byID[r.ID] = r
+		}
+	}
+	for _, r := range cur {
+		byID[r.ID] = r
+	}
+	out := make([]types.Resource, 0, len(byID))
+	for _, r := range byID {
+		out = append(out, r)
+	}
+	return out
+}
+
+func markOnPath(findings []types.Finding, paths []types.AttackPath) {
+	onPath := map[string][]string{}
+	for _, p := range paths {
+		for _, fid := range p.FindingIDs {
+			onPath[fid] = append(onPath[fid], p.ID)
+		}
+	}
+	for i := range findings {
+		if ps, ok := onPath[findings[i].ID]; ok {
+			findings[i].OnPath = ps
+		}
+	}
+}
+
 func summarize(fs []types.Finding) types.PostureSummary {
-	sum := types.PostureSummary{Total: len(fs),
-		BySeverity: map[string]int{}, ByService: map[string]int{}, BySource: map[string]int{}}
+	sum := types.PostureSummary{Total: len(fs), BySeverity: map[string]int{}, ByService: map[string]int{}, BySource: map[string]int{}}
 	for _, f := range fs {
 		sum.BySeverity[string(f.Severity)]++
 		sum.ByService[f.Service]++
-		sum.BySource[f.Source]++
+		if len(f.Sources) > 0 {
+			for _, src := range f.Sources {
+				sum.BySource[src.Source]++
+			}
+		} else {
+			sum.BySource[f.Source]++
+		}
 	}
 	return sum
 }
 
-// ---- HTTP routing ----
-
-func (s *Server) Routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.health)
-	mux.HandleFunc("/api/v1/health", s.health)
-
-	// Auth (public).
-	mux.HandleFunc("/api/v1/auth/login", s.login)
-	mux.HandleFunc("/api/v1/auth/status", s.authStatus)
-
-	// Reviews.
-	mux.HandleFunc("/api/v1/review", s.runReview)        // POST (full account review)
-	mux.HandleFunc("/api/v1/review/latest", s.getLatest) // GET
-	mux.HandleFunc("/api/v1/reviews", s.listReviews)     // GET (history)
-
-	// Portal navigation.
-	mux.HandleFunc("/api/v1/services", s.getServices)   // GET landing: services + counts
-	mux.HandleFunc("/api/v1/regions", s.getRegions)     // GET enabled regions
-	mux.HandleFunc("/api/v1/resources", s.getResources) // GET ?service=&region=
-	mux.HandleFunc("/api/v1/resource", s.getResource)   // GET ?id= (resource audit view)
-
-	// On-demand audit (B5).
-	mux.HandleFunc("/api/v1/audit", s.audit) // POST ?service=&resource=
-
-	// Explanations + integration toggles.
-	mux.HandleFunc("/api/v1/explain", s.explain)           // POST ?review=&finding=
-	mux.HandleFunc("/api/v1/integrations", s.integrations) // GET (disabled toggles)
-
-	return cors(s.gate.Middleware(mux))
-}
-
-func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"status": "ok", "service": "nexogent", "store": s.store.Kind()})
-}
-
-// ---- Auth handlers ----
-
-func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", 405)
-		return
-	}
-	var body struct {
-		Password string `json:"password"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	tok, ok := s.gate.Login(body.Password)
-	if !ok {
-		writeJSON(w, 401, map[string]string{"error": "invalid credentials"})
-		return
-	}
-	writeJSON(w, 200, map[string]string{"token": tok, "role": auth.Role})
-}
-
-func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"auth_required": s.gate.Enabled(), "role": auth.Role})
-}
-
-// ---- Review handlers ----
-
-func (s *Server) runReview(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", 405)
-		return
-	}
-	review, err := s.RunReview(r.Context(), "", "")
-	if err != nil {
-		writeJSON(w, 502, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, 200, review)
-}
-
-func (s *Server) getLatest(w http.ResponseWriter, r *http.Request) {
-	rev, _ := s.store.Latest(r.Context())
-	if rev == nil {
-		writeJSON(w, 404, map[string]string{"error": "no review yet"})
-		return
-	}
-	writeJSON(w, 200, rev)
-}
-
-func (s *Server) listReviews(w http.ResponseWriter, r *http.Request) {
-	limit := 20
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			limit = n
+func countBySource(fs []types.Finding, src string) int {
+	n := 0
+	for _, f := range fs {
+		for _, s := range f.Sources {
+			if s.Source == src {
+				n++
+				break
+			}
 		}
 	}
-	reviews, _ := s.store.List(r.Context(), limit)
-	// Return a compact history (no full findings) for the trends view.
-	type item struct {
-		ReviewID     string    `json:"review_id"`
-		CreatedAt    time.Time `json:"created_at"`
-		PostureScore int       `json:"posture_score"`
-		Rating       string    `json:"rating"`
-		Total        int       `json:"total_findings"`
-	}
-	var out []item
-	for _, rv := range reviews {
-		out = append(out, item{rv.ReviewID, rv.CreatedAt, rv.PostureScore, rv.Rating, rv.Summary.Total})
-	}
-	writeJSON(w, 200, map[string]any{"reviews": out})
+	return n
 }
 
-// ---- Portal navigation handlers ----
-
-// getServices returns the supported services with resource/finding counts
-// from the latest review (B2 landing page).
-func (s *Server) getServices(w http.ResponseWriter, r *http.Request) {
-	rev, _ := s.store.Latest(r.Context())
-	resCount := map[string]int{}
-	findCount := map[string]int{}
-	if rev != nil {
-		for _, res := range rev.Resources {
-			resCount[res.Service]++
-		}
-		for _, f := range rev.Findings {
-			findCount[f.Service]++
+func countOpen(fs []types.Finding) int {
+	n := 0
+	for _, f := range fs {
+		if f.Status == types.StatusOpen || f.Status == types.StatusRegressed {
+			n++
 		}
 	}
-	out := make([]types.ServiceInfo, 0, len(supportedServices))
-	for _, svc := range supportedServices {
-		svc.ResourceCount = resCount[svc.Key]
-		svc.FindingCount = findCount[svc.Key]
-		out = append(out, svc)
-	}
-	writeJSON(w, 200, map[string]any{
-		"services":   out,
-		"has_review": rev != nil,
-	})
+	return n
 }
 
-func (s *Server) getRegions(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"regions": s.regions(r.Context())})
+func keys(m map[string]bool) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
-// getResources lists resources, optionally filtered by ?service= and ?region=
-// (B3 service page + region filter).
-func (s *Server) getResources(w http.ResponseWriter, r *http.Request) {
-	rev, _ := s.store.Latest(r.Context())
-	if rev == nil {
-		writeJSON(w, 404, map[string]string{"error": "no review yet — run an audit first"})
-		return
+func ids(fs []types.Finding) []string {
+	var out []string
+	for _, f := range fs {
+		out = append(out, f.ID)
 	}
-	svc := r.URL.Query().Get("service")
-	region := r.URL.Query().Get("region")
-
-	var resources []types.Resource
-	regionsSet := map[string]struct{}{}
-	findByResource := map[string]int{}
-	for _, f := range rev.Findings {
-		findByResource[f.ResourceID]++
-	}
-	for _, res := range rev.Resources {
-		if svc != "" && res.Service != svc {
-			continue
-		}
-		regionsSet[res.Region] = struct{}{}
-		if region != "" && res.Region != region {
-			continue
-		}
-		resources = append(resources, res)
-	}
-	sort.Slice(resources, func(i, j int) bool {
-		if resources[i].Region != resources[j].Region {
-			return resources[i].Region < resources[j].Region
-		}
-		return resources[i].Name < resources[j].Name
-	})
-
-	// Regions present for this service (for the region filter dropdown).
-	regionsList := make([]string, 0, len(regionsSet))
-	for rg := range regionsSet {
-		regionsList = append(regionsList, rg)
-	}
-	sort.Strings(regionsList)
-
-	// Attach finding counts per resource.
-	type resWithCount struct {
-		types.Resource
-		FindingCount int `json:"finding_count"`
-	}
-	enriched := make([]resWithCount, 0, len(resources))
-	for _, res := range resources {
-		enriched = append(enriched, resWithCount{res, findByResource[res.ID]})
-	}
-
-	writeJSON(w, 200, map[string]any{
-		"service":   svc,
-		"region":    region,
-		"regions":   regionsList,
-		"resources": enriched,
-	})
+	return out
 }
 
-// getResource returns one resource plus its findings (B4 resource = audit page).
-func (s *Server) getResource(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		writeJSON(w, 400, map[string]string{"error": "id required"})
-		return
+func scopeTag(service, resource string) string {
+	if resource != "" {
+		return "resource:" + resource
 	}
-	rev, _ := s.store.Latest(r.Context())
-	if rev == nil {
-		writeJSON(w, 404, map[string]string{"error": "no review yet"})
-		return
+	if service != "" {
+		return "service:" + service
 	}
-	var resource *types.Resource
-	for i := range rev.Resources {
-		if rev.Resources[i].ID == id {
-			resource = &rev.Resources[i]
-			break
+	return "account"
+}
+
+func ratingFromBands(score int, bands []settings.Band) string {
+	best := "Critical"
+	bestMin := -1
+	for _, b := range bands {
+		if score >= b.Min && b.Min >= bestMin {
+			best = b.Name
+			bestMin = b.Min
 		}
 	}
-	var findings []types.Finding
-	for _, f := range rev.Findings {
-		if f.ResourceID == id {
-			findings = append(findings, f)
-		}
-	}
-	sort.SliceStable(findings, func(i, j int) bool { return findings[i].RiskScore > findings[j].RiskScore })
-	writeJSON(w, 200, map[string]any{
-		"review_id": rev.ReviewID,
-		"resource":  resource,
-		"findings":  findings,
-		"count":     len(findings),
-	})
+	return best
 }
 
-// audit runs scanners on demand for a service/resource (B5). It triggers a
-// fresh scoped review and returns its findings.
-func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", 405)
-		return
-	}
-	service := r.URL.Query().Get("service")
-	resource := r.URL.Query().Get("resource")
-	review := s.RunAudit(r.Context(), service, resource)
-	writeJSON(w, 200, map[string]any{
-		"review_id":   review.ReviewID,
-		"service":     service,
-		"resource":    resource,
-		"findings":    review.Findings,
-		"count":       len(review.Findings),
-		"sources_run": review.SourcesRun,
-		"scanned_at":  review.CreatedAt,
-	})
-}
+func envWebhook() string { return getenv("SLACK_WEBHOOK_URL") }
 
-// ---- Explain + integrations ----
-
-func (s *Server) explain(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", 405)
-		return
-	}
-	reviewID := r.URL.Query().Get("review")
-	findingID := r.URL.Query().Get("finding")
-	review, _ := s.store.Get(r.Context(), reviewID)
-	if review == nil {
-		// Fall back to latest (on-demand audits return a review_id the client may re-use).
-		review, _ = s.store.Latest(r.Context())
-	}
-	if review == nil {
-		writeJSON(w, 404, map[string]string{"error": "review not found"})
-		return
-	}
-	for _, f := range review.Findings {
-		if f.ID == findingID {
-			writeJSON(w, 200, s.explainer.Explain(r.Context(), f))
-			return
-		}
-	}
-	writeJSON(w, 404, map[string]string{"error": "finding not found"})
-}
-
-// integrations returns GuardDuty / Security Hub / Inspector as DISABLED toggles
-// (B6). They are not wired to AWS in v1.
-func (s *Server) integrations(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"integrations": []types.Integration{
-		{Key: "guardduty", Name: "Amazon GuardDuty", Enabled: false, Available: false,
-			Description: "Continuous threat detection (active threats, not just misconfig).",
-			Note:        "Disabled in v1. Enable in a later version."},
-		{Key: "securityhub", Name: "AWS Security Hub", Enabled: false, Available: false,
-			Description: "Aggregated findings and compliance standards across services.",
-			Note:        "Disabled in v1. Enable in a later version."},
-		{Key: "inspector", Name: "Amazon Inspector", Enabled: false, Available: false,
-			Description: "Automated vulnerability scanning for workloads and images.",
-			Note:        "Disabled in v1. Enable in a later version."},
-	}})
-}
-
-// ---- helpers ----
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func cors(h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", strings.Join([]string{"Authorization", "Content-Type"}, ", "))
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(204)
-			return
-		}
-		h.ServeHTTP(w, r)
-	})
-}
+// small indirection so tests can stub (kept simple).
+var getenv = func(k string) string { return osGetenv(k) }
