@@ -1,52 +1,45 @@
-# Nexogent — Deployment Guide (Free Build, v2)
+# Nexogent — Deployment & Architecture (Free Build)
 
-How the MSP deploys Nexogent into a managed client's AWS account, onto their EKS
-cluster. Also covers **local mode** (laptop) and **demo mode** (no AWS).
+How the free build is put together and how it runs inside our own AWS account
+(`eks-lab`, us-east-1). This is the env we build and test on before the paid build
+goes to a client account.
 
-> Read-only product. It reads the account and reports; it changes nothing.
-> No static AWS keys run inside the cluster — access is via IRSA.
+> This document explains **how it works** — the architecture, the microservices, how
+> they connect, and how it is built. The actual setup/install/deploy commands live in
+> **RUNBOOK.md**.
 
----
-
-## 0. Prerequisites
-See **PREREQUISITES.md**. In short: an EKS cluster with an OIDC provider, the EBS CSI
-driver and the AWS Load Balancer Controller; permission to create two ECR repos, a
-read-only IAM role + IRSA service account, a DynamoDB table, and a namespace-scoped
-Kubernetes Role/RoleBinding; a superadmin password and a session secret; optionally
-an ACM certificate (HTTPS), a Bedrock model, and a Slack webhook.
-
-Deploy-time credentials are configured locally (`aws configure`) or assumed via a
-role. Never paste AWS keys into a chat or commit them.
+> Read-only product. It reads the account and reports; it changes nothing on AWS.
+> No static AWS keys run in the cluster — access is via IRSA.
 
 ---
 
-## 1. Architecture (in-cluster, microservices)
+## 1. Microservice architecture (in-cluster)
 
 ```
                          Internet
-                            │                 (HTTPS when an ACM cert is set;
+                            │                 (HTTPS when an ACM cert + domain are set;
                    ┌────────▼─────────┐        optional source-IP allow-list)
                    │   ALB Ingress    │
                    │  / → frontend    │
                    │  /api → backend  │
                    └────────┬─────────┘
                             │
-   ┌────────────────────────┼──────────── EKS (client's cluster) ─────────────────┐
-   │  Namespace: nexogent   │                                                     │
-   │   ┌──────────────┐     │     ┌────────────────────────────────┐              │
-   │   │  frontend    │◄────┴────►│   backend (Go API/agent)       │              │
-   │   │ (React/Nginx)│   HTTP    │  discovery · own checks ·      │              │
-   │   │  risk-first  │           │  lifecycle · dedupe · rank ·   │              │
-   │   │  portal      │           │  attack paths · reports ·      │              │
-   │   └──────────────┘           │  alerts · signed sessions      │              │
-   │                              └────┬─────────────┬──────┬──────┘              │
-   │     reads results (shared PVC) ───┘             │      │ creates Jobs (RBAC) │
-   │   ┌───────────── scanners ─────────────────┐    │      ▼                     │
-   │   │ prowler CronJob + on-demand Jobs       │    │   batch/Jobs (deep scan)   │
-   │   │ (scoutsuite, cloudsplaining optional)  │    │                            │
-   │   │ co-located with backend via podAffinity│    │ IRSA (read-only role)      │
-   │   └──────────────────┬─────────────────────┘    │                            │
-   └──────────────────────┼──────────────────────────┼────────────────┬───────────┘
+   ┌────────────────────────┼──────────── EKS: eks-lab (namespace nexogent) ────────┐
+   │                        │                                                       │
+   │   ┌──────────────┐     │     ┌────────────────────────────────┐                │
+   │   │  frontend    │◄────┴────►│   backend (Go API/agent)       │                │
+   │   │ (React/Nginx)│   HTTP    │  discovery · own checks ·      │                │
+   │   │  risk-first  │           │  lifecycle · dedupe · rank ·   │                │
+   │   │  portal      │           │  attack paths · reports ·      │                │
+   │   └──────────────┘           │  alerts · signed sessions      │                │
+   │                              └────┬─────────────┬──────┬──────┘                │
+   │     reads results (shared PVC) ───┘             │      │ creates Jobs (RBAC)   │
+   │   ┌───────────── scanners ─────────────────┐    │      ▼                       │
+   │   │ prowler CronJob + on-demand Jobs       │    │   batch/Jobs (deep scan)     │
+   │   │ (scoutsuite, cloudsplaining optional)  │    │                              │
+   │   │ co-located with backend via podAffinity│    │ IRSA (read-only role)        │
+   │   └──────────────────┬─────────────────────┘    │                              │
+   └──────────────────────┼──────────────────────────┼────────────────┬────────────┘
                           │ results volume (EBS PVC) │                │
        ┌──────────────────┴───────────┐         ┌────┴───────┐   ┌────▼──────────────┐
        ▼        ▼      ▼     ▼     ▼   ▼        ▼            ▼   │  DynamoDB         │
@@ -55,197 +48,108 @@ role. Never paste AWS keys into a chat or commit them.
                                                                  └───────────────────┘
 ```
 
-`helm install` creates: **nexogent-backend** (Deployment+Service),
-**nexogent-frontend** (Deployment+Service), **nexogent-prowler** (CronJob, plus
-backend-created on-demand Jobs), a shared **PVC**, an **Ingress** (ALB), an auth
-**Secret** (superadmin password + session secret), and a **Role + RoleBinding** that
-lets the backend run deep scans (read the CronJob; create/get/list Jobs — nothing on
-AWS, nothing outside the namespace). ScoutSuite and cloudsplaining CronJobs are
-included but disabled by default.
+A deploy creates these objects in the `nexogent` namespace:
+
+| Object | Kind | Role |
+|---|---|---|
+| `nexogent-backend` | Deployment + Service | the Go agent/API |
+| `nexogent-frontend` | Deployment + Service | the React portal (Nginx) |
+| `nexogent-prowler` | CronJob (+ on-demand Jobs) | the Prowler scanner |
+| `nexogent-prowler-results` | PVC (EBS) | shared scanner output |
+| `nexogent` | Ingress (ALB) | public entry: `/` → frontend, `/api`+`/health` → backend |
+| `nexogent-auth` | Secret | superadmin password + session secret (+ optional Slack webhook) |
+| `nexogent-sa` | ServiceAccount (IRSA) | the read-only AWS role |
+| `nexogent-deepscan` | Role + RoleBinding | lets the backend run on-demand Prowler Jobs |
+
+ScoutSuite and cloudsplaining CronJobs are shipped but disabled by default.
 
 ---
 
-## 2. Cluster prerequisites (one-time per cluster)
-Full commands in `deploy/CLUSTER_PREREQS.md`:
-- **Amazon EBS CSI driver** — provisions the shared PVC.
-- **AWS Load Balancer Controller** — turns the `alb` Ingress into an ALB.
+## 2. The three microservices and how they connect
 
-```bash
-kubectl get csidriver ebs.csi.aws.com
-kubectl get ingressclass alb
-```
-If either is absent, deploy with `--set prowler.enabled=false` and/or
-`--set ingress.enabled=false`.
+### Backend (`nexogent-backend`) — pure Go
+The agent and the HTTP API. It:
+- **discovers** every resource across all enabled regions (read-only AWS SDK),
+- runs its **own read-only checks** and **ingests** the scanners' results,
+- gives each finding a **stable fingerprint** and a **lifecycle** (open / fixed /
+  regressed / accepted), **deduplicates** across sources, and **ranks** by a
+  weighted rubric,
+- computes **attack paths**, builds **reports**, evaluates **Slack alerts**,
+- persists everything to **DynamoDB**,
+- serves the API behind a **signed-session auth gate** with security headers.
 
----
+It assumes the read-only IAM role via **IRSA** — no static keys. The only thing it
+writes is its own DynamoDB table.
 
-## 3. Build and push the images (ECR)
-Two private ECR repos, one per image.
+### Frontend (`nexogent-frontend`) — React + Nginx
+The risk-first portal (Overview, Findings, Attack paths, Inventory, Risks, Reports,
+Activity, Settings). Nginx serves the built SPA and **proxies** `/api` and `/health`
+to the backend Service, and sets security headers (CSP, nosniff, frame-deny). The
+browser talks only to the frontend origin; the frontend reaches the backend over the
+in-cluster Service DNS (`nexogent-backend:8080`).
 
-```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-REGION=us-east-1
-ECR=$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
-aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR
+### Scanners (`nexogent-prowler`, optional ScoutSuite/cloudsplaining)
+Open-source scanners run as **Kubernetes Jobs/CronJobs** under the same read-only
+IRSA role. They write results to the **shared EBS PVC**; the backend reads that
+volume and normalises everything into one `Finding` model. On-demand **deep scans**
+are started by the backend creating a Job from the CronJob (the namespace-scoped
+RBAC Role grants exactly that — nothing on AWS, nothing outside the namespace).
 
-for repo in nexogent nexogent-frontend; do
-  aws ecr describe-repositories --repository-names $repo --region $REGION >/dev/null 2>&1 \
-    || aws ecr create-repository --repository-name $repo --region $REGION
-done
+### Data store (DynamoDB)
+One on-demand table (`nexogent-reviews`) holds reviews, history/trend, the
+accepted-risk register, remediation plans, report snapshots, the audit log,
+settings, and the scheduler lease. Large reviews are chunked to stay under the
+item-size limit. Review history is what lets the product show "what's new, what was
+fixed, how long it's been open".
 
-docker build --platform linux/amd64 -t $ECR/nexogent:latest .
-docker push $ECR/nexogent:latest
-docker build --platform linux/amd64 -t $ECR/nexogent-frontend:latest ./dashboard
-docker push $ECR/nexogent-frontend:latest
-```
-
----
-
-## 4. Read-only IAM role + IRSA
-The agent and scanners assume one role allowing only `Describe*/Get*/List*` on the
-read services plus (optional) `bedrock:InvokeModel`, plus read/write on the single
-DynamoDB table. No write/delete on account resources.
-
-```bash
-CLUSTER=eks-lab
-aws iam create-policy --policy-name NexogentReadOnly \
-  --policy-document file://deploy/iam/nexogent-readonly-policy.json || true
-
-eksctl utils associate-iam-oidc-provider --cluster $CLUSTER --approve
-eksctl create iamserviceaccount \
-  --cluster $CLUSTER --namespace nexogent --name nexogent-sa \
-  --role-name NexogentReadOnly \
-  --attach-policy-arn arn:aws:iam::$ACCOUNT_ID:policy/NexogentReadOnly \
-  --approve --override-existing-serviceaccounts
-```
-
-The policy covers the reads listed in PREREQUISITES §4 (including the extra IAM/EC2/
-S3/CloudTrail calls the lifecycle, facts, and new own checks need). The only write
-grant is to the `nexogent-reviews` table.
+### Bedrock (optional)
+Amazon Bedrock only turns already-detected findings into plain-English wording and
+report narrative. It never detects anything and never changes a number. If it is
+unavailable, built-in templates are used and nothing breaks.
 
 ---
 
-## 5. DynamoDB table (persistence)
-One on-demand table holds reviews, history, the accepted-risk register, plans,
-reports, the audit log, settings, and the scheduler lease. Large reviews are chunked
-to stay under the item-size limit.
+## 3. How it's built
 
-```bash
-aws dynamodb create-table --table-name nexogent-reviews --region $REGION \
-  --billing-mode PAY_PER_REQUEST \
-  --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \
-  --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE
-```
-Without a table the backend falls back to in-memory (local and demo modes only).
-
----
-
-## 6. Deploy with Helm
-Set the superadmin password; the chart generates/reuses a session secret. For HTTPS,
-pass the ACM certificate ARN (and optionally an IP allow-list).
-
-```bash
-ROLE_ARN=$(aws iam get-role --role-name NexogentReadOnly --query 'Role.Arn' --output text)
-
-helm upgrade --install nexogent deploy/helm/nexogent \
-  --namespace nexogent --create-namespace \
-  --set backend.image.repository=$ECR/nexogent        --set backend.image.tag=latest \
-  --set frontend.image.repository=$ECR/nexogent-frontend --set frontend.image.tag=latest \
-  --set serviceAccount.roleArn=$ROLE_ARN \
-  --set region=$REGION \
-  --set persistence.reviewsTable=nexogent-reviews \
-  --set-string auth.password="$SUPERADMIN_PASSWORD" \
-  --set ingress.host="nexogent.example.com" \
-  --set ingress.certificateArn="arn:aws:acm:$REGION:$ACCOUNT_ID:certificate/XXXX" \
-  --set ingress.inboundCidrs="203.0.113.0/24"
-```
-
-Useful values:
-- `ingress.certificateArn` — enables HTTPS + HTTP→HTTPS redirect. Omit to run HTTP
-  (a warning is shown; use `ingress.inboundCidrs` to restrict access).
-- `ingress.inboundCidrs` — source IP allow-list on the ALB.
-- `scanInterval` / `settings.schedule` — scheduled review interval (default `6h`).
-- `prowler.schedule` — Prowler CronJob schedule; Prowler image is pinned (no `latest`).
-- `scoutsuite.enabled` / `cloudsplaining.enabled` — enable the optional scanners.
-- `backend.replicaCount` — safe to raise (a DynamoDB lease makes only one replica run
-  scheduled scans; signed sessions work across replicas).
-
-Backend environment set by the chart: `REVIEWS_TABLE`, `SESSION_SECRET`,
-`SESSION_TTL`, `SUPERADMIN_PASSWORD`, `TRUST_PROXY=true`, `PUBLIC_URL`,
-`KUBE_NAMESPACE`, `PROWLER_CRONJOB_NAME`, `ALLOWED_ORIGIN` (empty = same-origin),
-`DEMO_MODE=false`, optional `BEDROCK_MODEL_ID`.
-
-Verify:
-```bash
-kubectl -n nexogent get deploy,svc,cronjob,ingress,role,rolebinding,pods
-URL=$(kubectl -n nexogent get ingress nexogent -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-curl -s https://$URL/health            # or http:// if no certificate configured
-# Sign in (superadmin) → the portal drives the API:
-#   POST /api/v1/auth/login            → signed session token
-#   GET  /api/v1/overview              → score, trend, what changed, top fixes
-#   GET  /api/v1/findings?status=open  → the queue
-#   POST /api/v1/scans/deep            → on-demand Prowler job
-#   POST /api/v1/reports {scope}       → create a report, then submit/approve/download
-```
+- **Backend image** — multi-stage: compile the pure-Go static binary, then ship it
+  on a distroless nonroot base. Tiny, no shell, no interpreter.
+- **Frontend image** — multi-stage: Vite builds the React SPA, then it is served by
+  `nginxinc/nginx-unprivileged` (runs as uid 101) with writable `emptyDir` mounts
+  for the Nginx cache/pid/conf dirs. Config is templated with `envsubst` at start so
+  the backend Service name is injected.
+- Both images are pushed to **private ECR** repos (`nexogent`, `nexogent-frontend`),
+  one per image, and tagged `latest` with `imagePullPolicy: Always` so a redeploy
+  always pulls the new image.
+- The **Helm chart** (`deploy/helm/nexogent`) renders every object above from
+  `values.yaml`. The session secret is generated by the chart and **reused on
+  upgrade** (via `helm lookup`) so sessions survive restarts and multiple replicas.
 
 ---
 
-## 7. Scale the node group (if needed)
-```bash
-aws eks update-nodegroup-config --cluster-name $CLUSTER --nodegroup-name core \
-  --scaling-config minSize=1,maxSize=3,desiredSize=2
-```
-> EKS control plane and nodes bill hourly even when idle. Keep the count minimal;
-> scale down with `stop.sh` when not in use.
+## 4. Access & safety model
+
+- **IRSA, read-only.** The `NexogentReadOnly` IAM policy allows only
+  `Describe*/Get*/List*` across the audited services (EC2, S3, IAM, Lambda, RDS,
+  DynamoDB, EKS, CloudTrail, KMS, CloudWatch, Logs, SNS, Access Analyzer) plus
+  optional `bedrock:InvokeModel`. The one read/write grant is scoped to the single
+  `nexogent-reviews` DynamoDB table — never client resources.
+- **No static keys** anywhere in the cluster.
+- **Portal auth.** Every data endpoint requires a signed superadmin session token
+  (no `?token=` in URLs); logins are throttled; security headers + CSP are set.
+- **Multi-replica safe.** Sessions are stateless (HMAC-signed); a DynamoDB lease
+  ensures only one replica runs scheduled scans.
+- **HTTPS.** With an ACM certificate + domain, the ALB serves HTTPS and redirects
+  HTTP → 443. Without them it runs HTTP (the portal shows a warning); an IP
+  allow-list can restrict access in the meantime.
 
 ---
 
-## 8. Local mode (no cluster)
-Run the backend + portal on a laptop against the MSP's own read-only AWS profile.
-See `docs/LOCAL.md`.
+## 5. Environments
 
-```bash
-cp .env.example .env     # set SUPERADMIN_PASSWORD, AWS_PROFILE, AWS_REGION
-docker compose up        # backend + frontend; deep scan is unavailable (no cluster)
-docker compose --profile scan up   # also run Prowler once into a shared volume
-```
-The host `~/.aws` is mounted read-only; no keys are copied into any image.
+- **This free build runs in our own AWS account** (`eks-lab`). For now, our account
+  *is* the test/local environment — we build and verify the whole product here.
+- The **paid build** (native AWS security-service readers) and **client-account**
+  deployment come later and are out of scope for this build.
 
----
-
-## 9. Demo mode (no AWS)
-For sales demonstrations and portal testing with clearly fake data.
-
-```bash
-DEMO_MODE=true SUPERADMIN_PASSWORD=demo SESSION_SECRET=$(openssl rand -hex 32) \
-  go run ./cmd/nexogent
-```
-No AWS call is made and no credential is needed. Every page and report shows a
-"Demo data, not a real account" banner.
-
----
-
-## 10. Spin-up / teardown scripts
-- `start.sh` — ensures both ECR repos, builds+pushes both images, ensures the IAM
-  role/IRSA, the DynamoDB table and the Kubernetes Role/RoleBinding, checks the
-  cluster add-ons, scales the node group up, and `helm install`s Nexogent. Reads
-  `SUPERADMIN_PASSWORD` from the environment.
-- `stop.sh` — `helm uninstall`s Nexogent and scales the node group down to stop
-  billing. `--purge` also removes the IAM policy/role, both ECR repos, the DynamoDB
-  table, the Role/RoleBinding, and the `nexogent` namespace. (Never deletes the
-  cluster or other workloads.)
-
----
-
-## 11. Handover
-After deployment the client holds full admin. Nexogent runs under the read-only IRSA
-role; the supplier retains no standing access. To remove Nexogent entirely, run
-`stop.sh --purge` and confirm the ECR repos, IAM policy/role, DynamoDB table,
-Kubernetes Role/RoleBinding, and the `nexogent` namespace are gone.
-
----
-
-## 12. Troubleshooting
-See `docs/RUNBOOK.md` (scan stuck, deep scan failed, Prowler file missing, DynamoDB
-throttling, rotating the password/session secret, scaling down to stop billing) and
-`docs/VERIFY.md` (the post-deploy verification checklist).
+See **RUNBOOK.md** for the exact commands to deploy, verify, operate, and tear down,
+and **VERIFY.md** for the test cases that prove the platform works.
