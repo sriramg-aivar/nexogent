@@ -1,0 +1,63 @@
+{
+  "product": "Nexogent",
+  "one_liner": "An AWS SecOps agent deployed into each client's own AWS account that discovers all resources, runs read-only security checks, ranks findings by risk, and shows a posture dashboard with Bedrock-generated explanations.",
+  "delivery_model": {
+    "type": "per-client product, NOT SaaS",
+    "how": "We take this repo and deploy it directly into the client's AWS account (their EKS). The agent runs 24/7 inside their account.",
+    "access": "Client has full admin. We get temporary deploy access via what PREREQUISITES.md lists. After deploy it is their account; we do not retain access.",
+    "safety": "READ-ONLY and recommend-only. Never changes, deletes, or remediates anything in AWS."
+  },
+  "language_decision": {
+    "primary": "Pure Go (single static binary, k8s-native, small image).",
+    "no_python": "No Python anywhere. The 'ML/AI' layer is Amazon Bedrock (a hosted API) called via the Go SDK, so no local ML runtime is needed.",
+    "dashboard": "React (JS)."
+  },
+  "dropped": [
+    "The old CodeSentinel file scanner (Semgrep/Gitleaks/Trivy) is NOT part of this product.",
+    "GuardDuty, Security Hub, Inspector are NOT used (trial-only, then paid). Rely on free read-only AWS APIs + open-source Prowler."
+  ],
+  "architecture": {
+    "cmd/nexogent": "Go agent / API server entrypoint.",
+    "internal/types": "Core domain types (Resource, Finding, RiskFactors, PostureReview, Explanation).",
+    "internal/discovery": "Read-only AWS resource inventory grouped by service (ec2,s3,iam,lambda,rds,dynamodb,eks).",
+    "internal/collectors": "Read-only security checks (own-checks now; Prowler collector to add).",
+    "internal/ranking": "Deterministic risk rubric: severity 0.40, exposure 0.25, reachability 0.20, resource_criticality 0.15 -> 0..100. Posture score penalties CRIT20/HIGH12/MED5/LOW2. Ratings 90 Excellent/75 Good/60 Needs Improvement/else Critical. HAS TESTS.",
+    "internal/bedrock": "Bedrock Claude explanations with offline fallback (never breaks the demo).",
+    "internal/api": "HTTP API: GET /health, POST /api/v1/review, GET /api/v1/review/latest, GET /api/v1/resources (grouped by service), POST /api/v1/explain?review=&finding=.",
+    "dashboard/": "React dashboard: resources grouped by service, select a resource/service to view audit findings + posture; Explain button -> Bedrock/offline.",
+    "deploy/helm/nexogent": "Helm chart for per-client deployment (namespace, IRSA read-only SA, deployment, service, ingress)."
+  },
+  "aws_context": {
+    "account_id": "338449997393",
+    "iam_user_local_profile": "admin-sri (configured locally via aws configure; do NOT paste keys in chat)",
+    "region": "us-east-1",
+    "eks_cluster": "eks-lab (v1.37, ACTIVE)",
+    "eks_nodegroup": "core",
+    "bedrock": "Anthropic Claude models available in us-east-1 (e.g. us.anthropic.claude-haiku-4-5-20251001-v1:0). admin-sri currently lacks bedrock:InvokeModel OR model access not granted -> offline fallback works; fix IAM/model-access for live Bedrock.",
+    "note": "EKS control plane + nodes bill hourly even idle. Set a budget alarm. Scale nodegroup down when not demoing."
+  },
+  "verified_live": "Pure-Go agent ran read-only against account 338449997393 us-east-1: posture score 15/100 Critical, 7 findings (SSH 0.0.0.0/0 ranked #1 at 94, EKS public endpoint, IAM no-MFA x2, S3/admin), 5 resources discovered grouped as ec2/eks/iam. go build ./... OK, go test ./... passing.",
+  "repo": {
+    "github": "sriramg-aivar/nexogent (PRIVATE)",
+    "default_branch": "main",
+    "module": "github.com/sriramg-aivar/nexogent"
+  },
+  "pending_tasks": [
+    "Write docs: docs/PRODUCT.md, docs/SOW.md, docs/DEPLOYMENT.md, docs/PREREQUISITES.md (no Aivar/Ingram mentions anywhere).",
+    "Add Prowler collector (run Prowler as k8s Job or in-container; parse OCSF JSON).",
+    "Build the React dashboard (resources grouped by service + posture + explain drawer).",
+    "Write Helm chart templates under deploy/helm/nexogent (namespace, IRSA SA, deployment, service, ingress, values.yaml).",
+    "Create ECR repo, build/push the Go image, read-only IAM policy + IRSA service account on eks-lab.",
+    "Scale up nodegroup 'core', helm install, expose via ingress/LoadBalancer, get a public URL.",
+    "Write start.sh (full spin-up) and stop.sh (full teardown to stop billing).",
+    "Verify end-to-end in-cluster (agent uses IRSA, no static keys).",
+    "Fix Bedrock IAM/model access so live explanations work (offline fallback already fine).",
+    "After migration verified: delete the old 'final' branch in the old Codesentinal repo."
+  ],
+  "rules": [
+    "Never use AWS keys pasted into chat; only the locally configured profile / in-cluster IRSA.",
+    "Read-only only; no AWS mutations.",
+    "Do not mention Aivar, Ingram, or 'Agentic MSP' anywhere in the product.",
+    "Keep it pure Go; no Python."
+  ]
+}
